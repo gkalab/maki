@@ -134,7 +134,8 @@ impl MessagesPanel {
             scroll: ScrollPos::default(),
             auto_scroll: true,
             viewport_height: 24,
-            viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
+            viewport_width: crate::terminal::terminal_size()
+                .map_or(80, |(w, _)| w.saturating_sub(1)),
             cache: SegmentCache::new(),
             tail: Vec::new(),
             hl_worker: RenderWorker::new(),

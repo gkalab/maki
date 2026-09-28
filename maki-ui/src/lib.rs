@@ -83,7 +83,7 @@ impl OpenSession {
 /// Width of the controlling terminal, if any. Answers even when stdout is
 /// redirected, so callers that care gate on [`std::io::IsTerminal`].
 pub fn terminal_width() -> Option<u16> {
-    crossterm::terminal::size().ok().map(|(w, _)| w)
+    crate::terminal::terminal_size().map(|(w, _)| w)
 }
 
 pub use event_loop::EventLoopParams;
@@ -105,9 +105,9 @@ pub enum RunOutcome {
 
 pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
     let report = {
-        let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
+        let (mut guard, reader) = terminal::TerminalGuard::init()?;
         color_compat::init();
-        let el = event_loop::EventLoop::new(&mut terminal, params)?;
+        let el = event_loop::EventLoop::new(&mut guard, reader, params)?;
         el.run(initial_prompt)?
     };
     // Nothing is going to ask for a file list after the last frame, and a walk

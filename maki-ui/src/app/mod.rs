@@ -56,7 +56,6 @@ use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
@@ -72,6 +71,7 @@ use maki_lua::{
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
+use termina::event::{KeyCode, KeyEvent, MouseEvent};
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
@@ -1023,7 +1023,7 @@ impl App {
                 KeyCode::Enter => {
                     self.queue.remove_focused();
                 }
-                KeyCode::Esc => self.queue.unfocus(),
+                KeyCode::Escape => self.queue.unfocus(),
                 _ if key::QUIT.matches(key) => self.queue.unfocus(),
                 _ if key::POP_QUEUE.matches(key) => {
                     self.queue.remove(0);
@@ -1227,7 +1227,7 @@ impl App {
         if !self.is_main_chat() {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
+                KeyCode::Escape if !self.chats[self.active_chat].is_finished() => {
                     if let Some(t) = self.last_esc.take()
                         && t.elapsed() < self.status_bar.flash_duration
                     {
@@ -1267,7 +1267,7 @@ impl App {
     /// above, so the popup takes the first `Esc` and the next one, with the
     /// popup gone, arms the cancel.
     fn reserved_by_host(&self, key: KeyEvent) -> bool {
-        is_reserved(key) || (self.status == Status::Streaming && key.code == KeyCode::Esc)
+        is_reserved(key) || (self.status == Status::Streaming && key.code == KeyCode::Escape)
     }
 
     /// Whether a plugin binding claimed {key}. The binding the keymap matched
@@ -1319,7 +1319,7 @@ impl App {
                 vec![]
             }
             InputAction::Passthrough(key) => {
-                if key.code != KeyCode::Esc {
+                if key.code != KeyCode::Escape {
                     self.last_esc = None;
                 }
                 match key.code {
@@ -1332,7 +1332,7 @@ impl App {
                         vec![]
                     }
                     KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                    KeyCode::Esc => {
+                    KeyCode::Escape => {
                         if let Some(t) = self.last_esc.take()
                             && t.elapsed() < self.status_bar.flash_duration
                         {

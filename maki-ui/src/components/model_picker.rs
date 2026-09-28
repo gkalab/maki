@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
+use termina::event::{KeyCode, KeyEvent};
 
 use maki_providers::Model;
 use maki_providers::ModelTier;
@@ -344,9 +344,9 @@ mod tests {
     use super::*;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
-    use crossterm::event::{KeyCode, KeyEvent};
     use maki_providers::ModelInfo;
     use maki_providers::ModelPricing;
+    use termina::event::{KeyCode, KeyEvent};
     use test_case::test_case;
 
     const SAME_SIZED_LIST: &str = "a republished list of the same length is still a new list";
@@ -384,7 +384,7 @@ mod tests {
         models
     }
 
-    #[test_case(key(KeyCode::Esc)          ; "esc_closes")]
+    #[test_case(key(KeyCode::Escape)          ; "esc_closes")]
     #[test_case(kb::QUIT.to_key_event()    ; "ctrl_c_closes")]
     fn close_keys(cancel_key: KeyEvent) {
         let mut p = ModelPicker::new(test_models());

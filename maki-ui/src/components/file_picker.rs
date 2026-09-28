@@ -3,7 +3,6 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent};
 use maki_agent::file_index::MAX_ENTRIES;
 use maki_agent::{FILE_MATCH_CONFIG, FileReader, file_haystack_owned, file_index};
 use nucleo::pattern::{CaseMatching, Normalization};
@@ -13,6 +12,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use termina::event::{KeyCode, KeyEvent};
 use tracing::warn;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -203,7 +203,7 @@ impl FilePickerModal {
         };
 
         match key.code {
-            KeyCode::Esc => return FilePickerModalAction::Close,
+            KeyCode::Escape => return FilePickerModalAction::Close,
             KeyCode::Enter => {
                 if !s.visible {
                     return FilePickerModalAction::Consumed;
@@ -673,13 +673,13 @@ fn build_highlighted_line<'a>(
 mod tests {
     use super::*;
     use crate::repaint::expect::{OWED, QUIET};
-    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use maki_agent::{FileIndex, FileQuery, Ranked, file_pattern};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use tempfile::TempDir;
+    use termina::event::{KeyEventKind, KeyEventState, Modifiers};
     use test_case::test_case;
 
     /// Waits on the matcher are bounded by wall clock, not by a tick budget:
@@ -767,7 +767,7 @@ mod tests {
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
             code,
-            modifiers: KeyModifiers::NONE,
+            modifiers: Modifiers::NONE,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
@@ -1318,7 +1318,7 @@ mod tests {
     fn esc_returns_close() {
         let (mut picker, _index) = pending_picker();
         assert!(matches!(
-            picker.handle_key(key(KeyCode::Esc)),
+            picker.handle_key(key(KeyCode::Escape)),
             FilePickerModalAction::Close
         ));
     }

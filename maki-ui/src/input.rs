@@ -1,12 +1,13 @@
 //! Terminal input on a dedicated thread. The event loop waits on all of its
 //! channels at once (input, plugin UI actions, agent events) via a flume
-//! `Selector`; blocking inside `crossterm::event::poll` would make terminal
+//! `Selector`; blocking inside termina's `EventReader` would make terminal
 //! input the only thing able to wake it.
 
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crossterm::event::{self, Event};
+use termina::EventReader;
+use termina::event::Event;
 use tracing::warn;
 
 /// How often the reader re-checks for control messages; bounds how long
@@ -20,7 +21,7 @@ enum Ctl {
     Stop,
 }
 
-/// Reads crossterm events on its own thread and forwards them to a channel.
+/// Reads termina events on its own thread and forwards them to a channel.
 /// On a read error the thread exits and the channel disconnects, which the
 /// event loop treats as fatal. Dropping the reader joins the thread so no
 /// input is consumed after the UI hands the terminal back.
@@ -31,12 +32,12 @@ pub(crate) struct InputReader {
 }
 
 impl InputReader {
-    pub(crate) fn spawn() -> Self {
+    pub(crate) fn spawn(reader: EventReader) -> Self {
         let (tx, rx) = flume::unbounded::<Event>();
         let (ctl_tx, ctl_rx) = flume::unbounded::<Ctl>();
         let join = std::thread::Builder::new()
             .name("input-reader".into())
-            .spawn(move || read_loop(&tx, &ctl_rx))
+            .spawn(move || read_loop(&tx, &ctl_rx, reader))
             .expect("failed to spawn input reader thread");
         Self {
             rx,
@@ -81,7 +82,7 @@ impl Drop for PauseGuard<'_> {
     }
 }
 
-fn read_loop(tx: &flume::Sender<Event>, ctl_rx: &flume::Receiver<Ctl>) {
+fn read_loop(tx: &flume::Sender<Event>, ctl_rx: &flume::Receiver<Ctl>, reader: EventReader) {
     loop {
         match ctl_rx.try_recv() {
             Ok(Ctl::Pause(ack)) => {
@@ -99,9 +100,9 @@ fn read_loop(tx: &flume::Sender<Event>, ctl_rx: &flume::Receiver<Ctl>) {
             Ok(Ctl::Resume) | Err(flume::TryRecvError::Empty) => {}
             Ok(Ctl::Stop) | Err(flume::TryRecvError::Disconnected) => return,
         }
-        match event::poll(CTL_POLL_INTERVAL) {
+        match reader.poll(Some(CTL_POLL_INTERVAL), |_| true) {
             Ok(false) => {}
-            Ok(true) => match event::read() {
+            Ok(true) => match reader.read(|_| true) {
                 Ok(ev) => {
                     if tx.send(ev).is_err() {
                         return;

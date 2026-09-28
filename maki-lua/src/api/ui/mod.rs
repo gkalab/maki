@@ -9,6 +9,7 @@ use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
+use termina::{PlatformTerminal, Terminal as _};
 
 use crate::api::keymap::accept_key;
 use crate::api::util::command::{
@@ -297,6 +298,16 @@ fn humantime(_lua: &Lua, secs: u64) -> LuaResult<String> {
         .replace(' ', ""))
 }
 
+/// The controlling terminal's size in cells, or the conventional 80x24 when
+/// there is no live terminal handle to ask.
+fn window_size() -> (u16, u16) {
+    PlatformTerminal::new()
+        .ok()
+        .and_then(|t| t.get_dimensions().ok())
+        .map(|d| (d.cols, d.rows))
+        .unwrap_or((80, 24))
+}
+
 /// Returns the current terminal size. Handy for sizing floating windows
 /// or wrapping text to fit the screen.
 ///
@@ -306,7 +317,7 @@ fn humantime(_lua: &Lua, secs: u64) -> LuaResult<String> {
 /// local half_width = math.floor(size.cols / 2)
 #[lua_fn]
 fn terminal_size(lua: &Lua) -> LuaResult<Table> {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (cols, rows) = window_size();
     let tbl = lua.create_table()?;
     tbl.set("cols", cols)?;
     tbl.set("rows", rows)?;
@@ -666,7 +677,7 @@ fn open_win(
         keys,
     };
 
-    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (term_cols, term_rows) = window_size();
     let border_chrome = match config.border {
         Border::None => 0,
         _ => 2,

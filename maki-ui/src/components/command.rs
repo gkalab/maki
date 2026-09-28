@@ -1,7 +1,6 @@
 use std::mem;
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent};
 use maki_agent::command::CustomCommand;
 use maki_agent::{McpPromptInfo, McpSnapshotReader};
 use maki_lua::{LuaCommandInfo, LuaCommandReader};
@@ -12,6 +11,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
+use termina::event::{KeyCode, KeyEvent};
 
 use crate::theme;
 
@@ -292,7 +292,7 @@ impl CommandPalette {
                 self.move_down();
                 CommandAction::Consumed
             }
-            KeyCode::Esc => {
+            KeyCode::Escape => {
                 self.close();
                 CommandAction::Consumed
             }

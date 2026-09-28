@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use crossterm::event::KeyEvent;
 use maki_agent::{SharedBuf, SnapshotLine, SpanStyle};
 use maki_lua::{Anchor, Axis, Border, FloatConfig, Key, Split, TitlePos, WinCommand, WinEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use termina::event::KeyEvent;
 use unicode_width::UnicodeWidthStr;
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
@@ -947,9 +947,9 @@ impl Overlay for FloatManager {
 mod tests {
     use super::*;
     use crate::repaint::expect::{OWED, QUIET};
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_agent::SnapshotSpan;
     use maki_lua::{Dimension, FloatConfigPatch};
+    use termina::event::{KeyCode, KeyEvent, Modifiers};
     use test_case::test_case;
 
     const EXPECT_OPEN: &str = "expected manager to have open windows";
@@ -1832,11 +1832,11 @@ mod tests {
     /// `Tab + SHIFT` and every other one sends `CSI Z`, i.e. `BackTab`. One
     /// claim has to answer both, or a popup's binding works on half the
     /// terminals in the world.
-    #[test_case(KeyCode::Tab, KeyModifiers::SHIFT ; "kitty_reports_tab_with_shift")]
-    #[test_case(KeyCode::BackTab, KeyModifiers::NONE ; "everything_else_sends_csi_z")]
+    #[test_case(KeyCode::Tab, Modifiers::SHIFT ; "kitty_reports_tab_with_shift")]
+    #[test_case(KeyCode::BackTab, Modifiers::NONE ; "everything_else_sends_csi_z")]
     fn a_shift_tab_claim_answers_either_way_the_terminal_spells_it(
         code: KeyCode,
-        modifiers: KeyModifiers,
+        modifiers: Modifiers,
     ) {
         let mut mgr = FloatManager::new();
         let (events, _cmd_tx) = open_claiming(&mut mgr, &["<S-Tab>"], 50);
@@ -1851,7 +1851,7 @@ mod tests {
         let (events, _cmd_tx) = open_with_lines(&mut mgr, &["x"]);
 
         assert!(
-            mgr.handle_focused_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER)),
+            mgr.handle_focused_key(KeyEvent::new(KeyCode::Enter, Modifiers::SUPER)),
             "{EXPECT_FOCUS_OWNS_KEY}"
         );
         assert!(!took_a_key(&events), "{EXPECT_NOTHING_SENT}");
@@ -1864,7 +1864,7 @@ mod tests {
         let mut mgr = FloatManager::new();
         let (events, _cmd_tx) = open_claiming(&mut mgr, &["<CR>"], 50);
 
-        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER)));
+        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Enter, Modifiers::SUPER)));
         assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
     }
 

@@ -434,12 +434,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "base64"
-version = "0.23.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
-
-[[package]]
 name = "base64-simd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -949,12 +943,13 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 [[package]]
 name = "crossterm"
 version = "0.29.0"
-source = "git+https://github.com/crossterm-rs/crossterm?rev=3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77#3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
 dependencies = [
- "base64 0.23.1",
  "bitflags 2.13.1",
  "crossterm_winapi",
  "derive_more",
+ "document-features",
  "mio",
  "parking_lot",
  "rustix 1.1.4",
@@ -1173,6 +1168,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "document-features"
+version = "0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
+dependencies = [
+ "litrs",
 ]
 
 [[package]]
@@ -2444,7 +2448,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d46662859bc5f60a145b75f4632fbadc84e829e45df6c5de74cfc8e05acb96b5"
 dependencies = [
  "ahash",
- "base64 0.22.1",
+ "base64",
  "bytecount",
  "email_address",
  "fancy-regex 0.16.2",
@@ -2620,6 +2624,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
+name = "litrs"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2721,7 +2731,7 @@ dependencies = [
  "async-io",
  "async-lock",
  "async-process",
- "base64 0.22.1",
+ "base64",
  "bitflags 2.13.1",
  "event-listener",
  "flume 0.11.1",
@@ -2832,9 +2842,8 @@ version = "0.5.6"
 dependencies = [
  "arc-swap",
  "async-lock",
- "base64 0.22.1",
+ "base64",
  "criterion",
- "crossterm",
  "event-listener",
  "flume 0.11.1",
  "futures",
@@ -2867,6 +2876,7 @@ dependencies = [
  "smol",
  "strum 0.27.2",
  "tempfile",
+ "termina",
  "test-case",
  "thiserror 2.0.18",
  "toml",
@@ -2967,7 +2977,7 @@ dependencies = [
 name = "maki-providers"
 version = "0.5.6"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "fastrand",
  "flume 0.11.1",
  "futures",
@@ -3023,10 +3033,9 @@ dependencies = [
  "arc-swap",
  "async-lock",
  "async-process",
- "base64 0.22.1",
+ "base64",
  "color-eyre",
  "criterion",
- "crossterm",
  "flume 0.11.1",
  "futures-lite",
  "getrandom 0.3.4",
@@ -3054,6 +3063,7 @@ dependencies = [
  "strum 0.27.2",
  "syntect",
  "tempfile",
+ "termina",
  "termini",
  "test-case",
  "toml",
@@ -3981,7 +3991,7 @@ version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da1d65da6dd5d1e44199ac0f58712d241c0f439f80adea8924d832384087f85"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "indexmap 2.14.0",
  "quick-xml 0.41.0",
  "serde",
@@ -4371,7 +4381,6 @@ dependencies = [
  "instability",
  "ratatui-core",
  "ratatui-crossterm",
- "ratatui-macros",
  "ratatui-termina",
  "ratatui-termwiz",
  "ratatui-widgets",
@@ -4427,16 +4436,6 @@ dependencies = [
  "self_cell",
  "thiserror 1.0.69",
  "windows",
-]
-
-[[package]]
-name = "ratatui-macros"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed7dc68daa7498a43e4d68e0eb078427e10c38fbcfbb1e42d955f1fa2140d814"
-dependencies = [
- "ratatui-core",
- "ratatui-widgets",
 ]
 
 [[package]]
@@ -4955,7 +4954,7 @@ version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76a5c54c7310e7b8b9577c286d7e399ddd876c3e12b3ed917a8aabc4b96e9e8c"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bs58",
  "chrono",
  "hex",
@@ -5397,7 +5396,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4676b37242ccbd1aabf56edb093a4827dc49086c0ffd764a5705899e0f35f8f7"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64",
  "bitflags 2.13.1",
  "fancy-regex 0.11.0",
  "filedescriptor",

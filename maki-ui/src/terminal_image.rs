@@ -60,12 +60,16 @@ pub(crate) fn picker(inline_images: bool) -> Option<Picker> {
         return None;
     }
     let protocol = protocol_from_env(inline_images, |key| env::var(key).ok())?;
-    let font = crossterm::terminal::window_size()
-        .ok()
-        .filter(|size| size.columns > 0 && size.rows > 0)
-        .map(|size| FontSize::new(size.width / size.columns, size.height / size.rows))
-        .filter(|font| font.width > 0 && font.height > 0)
-        .unwrap_or(FALLBACK_FONT_SIZE);
+    // Pixels per cell; termina does not report pixel size on Windows, so that
+    // path falls back to the conventional guess.
+    let font = crate::terminal::terminal_window().and_then(|size| {
+        size.pixel_width
+            .zip(size.pixel_height)
+            .filter(|_| size.cols > 0 && size.rows > 0)
+            .map(|(w, h)| FontSize::new(w / size.cols, h / size.rows))
+            .filter(|font| font.width > 0 && font.height > 0)
+    });
+    let font = font.unwrap_or(FALLBACK_FONT_SIZE);
     #[allow(deprecated)]
     let mut picker = Picker::from_fontsize(font);
     picker.set_protocol_type(protocol);

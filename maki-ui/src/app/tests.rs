@@ -13,7 +13,6 @@ use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
     AgentMode, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
@@ -42,6 +41,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
+use termina::event::{KeyCode, KeyEvent, Modifiers, MouseButton, MouseEventKind};
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -251,7 +251,7 @@ fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Msg {
         kind,
         column,
         row,
-        modifiers: KeyModifiers::NONE,
+        modifiers: Modifiers::NONE,
     })
 }
 
@@ -542,9 +542,9 @@ fn altgr_chars_not_swallowed_by_ctrl_handler() {
     let mut app = test_app();
     let altgr_backslash = KeyEvent {
         code: KeyCode::Char('\\'),
-        modifiers: KeyModifiers::CONTROL | KeyModifiers::ALT,
-        kind: crossterm::event::KeyEventKind::Press,
-        state: crossterm::event::KeyEventState::NONE,
+        modifiers: Modifiers::CONTROL | Modifiers::ALT,
+        kind: termina::event::KeyEventKind::Press,
+        state: termina::event::KeyEventState::NONE,
     };
     app.update(Msg::Key(key(KeyCode::Char('h'))));
     app.update(Msg::Key(key(KeyCode::Char('i'))));
@@ -757,7 +757,7 @@ fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
 
 pub(crate) fn cancel_app(app: &mut App) {
     app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Key(key(KeyCode::Escape)));
 }
 
 pub(crate) fn error_app(app: &mut App) {
@@ -2399,11 +2399,11 @@ fn double_esc_cancels_flushes_and_fails_tools() {
         render_header: None,
     }))));
 
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Escape)));
     assert!(actions.is_empty());
 
     app.last_esc = Some(Instant::now());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Escape)));
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
     assert_eq!(app.status, Status::Idle);
     assert_eq!(app.chats[0].in_progress_count(), 0);
@@ -2420,7 +2420,7 @@ fn double_esc_idle_opens_rewind_picker() {
         .push_message(Message::user("hello".into()));
 
     app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Key(key(KeyCode::Escape)));
     assert!(app.rewind_picker.is_open());
 }
 
@@ -2428,7 +2428,7 @@ fn double_esc_idle_opens_rewind_picker() {
 fn double_esc_idle_no_user_turns_flashes_error() {
     let mut app = test_app();
     app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Key(key(KeyCode::Escape)));
     assert!(!app.rewind_picker.is_open());
 }
 
@@ -3253,7 +3253,7 @@ fn queue_esc_unfocuses_without_removing() {
     let mut app = app_with_queued_message();
     app.queue.set_focus_at(0);
 
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Key(key(KeyCode::Escape)));
     assert!(app.queue.focus().is_none());
     assert_eq!(app.queue.len(), 1);
 }
@@ -3413,7 +3413,7 @@ fn help_modal_consumes_keys_and_esc_closes() {
     app.update(Msg::Key(key(KeyCode::Char('i'))));
     assert_eq!(app.input_box.buffer.value(), "");
 
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Key(key(KeyCode::Escape)));
     assert!(!app.help_modal.is_open());
 }
 
@@ -4335,7 +4335,7 @@ fn search_escape_restores_scroll(scroll: ScrollPos, auto_scroll: bool) {
     app.active_chat().restore_scroll(scroll, auto_scroll);
 
     app.update(Msg::Key(kb::SEARCH.to_key_event()));
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Key(key(KeyCode::Escape)));
 
     assert!(!app.search_modal.is_open());
     assert_eq!(app.active_chat().scroll_pos(), scroll);
@@ -4487,7 +4487,7 @@ fn btw_modal_key_routing_and_animation() {
     assert!(app.btw_modal.is_open());
     assert_eq!(app.input_box.buffer.value(), "");
 
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Escape)));
     assert!(actions.is_empty());
     assert!(!app.btw_modal.is_open());
     assert_eq!(app.btw_modal.cadence(), Cadence::IDLE);
@@ -4956,7 +4956,7 @@ fn rewrite_plan(app: &mut App) {
 }
 
 fn dismiss_plan_esc(app: &mut App) {
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Key(key(KeyCode::Escape)));
 }
 
 #[test]
@@ -4998,14 +4998,14 @@ fn ctrl_t_noop_when_plan_not_ready() {
 
 /// The plugin-boundary identity of a press a test names by code, which is how
 /// the host sees it once [`maki_lua::Key::from_event`] has normalized it.
-fn plugin_key(code: KeyCode, modifiers: KeyModifiers) -> maki_lua::Key {
+fn plugin_key(code: KeyCode, modifiers: Modifiers) -> maki_lua::Key {
     maki_lua::Key::from_event(KeyEvent::new(code, modifiers)).expect(EXPECT_NAMEABLE)
 }
 
 fn install_override(
     app: &mut App,
     key: KeyCode,
-    modifiers: KeyModifiers,
+    modifiers: Modifiers,
 ) -> maki_lua::test_support::RequestProbe {
     app.keymap_reader =
         maki_lua::test_support::keymap_reader_with(vec![plugin_key(key, modifiers)]);
@@ -5055,7 +5055,7 @@ fn override_does_not_shadow_quit() {
 fn override_shadows_tab_mode_toggle() {
     let mut app = test_app();
     let initial_mode = app.state.mode;
-    let probe = install_override(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    let probe = install_override(&mut app, KeyCode::Tab, Modifiers::NONE);
 
     let actions = app.update(Msg::Key(key(KeyCode::Tab)));
 
@@ -5070,9 +5070,9 @@ fn override_shadows_tab_mode_toggle() {
 #[test]
 fn override_shadows_esc_builtin() {
     let mut app = test_app();
-    let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    let probe = install_override(&mut app, KeyCode::Escape, Modifiers::NONE);
 
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Escape)));
 
     assert!(actions.is_empty());
     assert!(probe.try_recv_keybind().is_some(), "{OVERRIDE_DISPATCHED}");
@@ -5177,7 +5177,7 @@ fn a_key_no_notation_names_never_reaches_the_chat_behind_a_focused_float(code: K
         cmd_rx,
     );
 
-    let actions = app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::SUPER)));
+    let actions = app.update(Msg::Key(KeyEvent::new(code, Modifiers::SUPER)));
 
     assert!(actions.is_empty(), "the float spends the key");
     assert_eq!(app.input_box.buffer.value(), HIDDEN_DRAFT);
@@ -5199,7 +5199,7 @@ const CLAIM_NOT_DELIVERED: &str = "the popup must not be handed a key it never c
 /// window the last frame put on screen.
 fn open_claiming_popup_keys(
     app: &mut App,
-    keys: &[(KeyCode, KeyModifiers)],
+    keys: &[(KeyCode, Modifiers)],
 ) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
     let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
     let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
@@ -5216,7 +5216,7 @@ fn open_claiming_popup_keys(
 fn open_claiming_popup(
     app: &mut App,
     key: KeyCode,
-    modifiers: KeyModifiers,
+    modifiers: Modifiers,
 ) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
     open_claiming_popup_keys(app, &[(key, modifiers)])
 }
@@ -5232,7 +5232,7 @@ fn took_a_key(events: &flume::Receiver<WinEvent>) -> bool {
 fn a_key_an_unfocused_popup_claimed_never_reaches_the_chat_input() {
     const TYPED: char = '@';
     let mut app = test_app();
-    let (events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let (events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, Modifiers::NONE);
 
     app.update(Msg::Key(key(KeyCode::Char(TYPED))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
@@ -5248,7 +5248,7 @@ fn a_key_an_unfocused_popup_claimed_never_reaches_the_chat_input() {
 fn a_key_no_popup_claimed_still_reaches_the_chat_input() {
     const TYPED: char = 'a';
     let mut app = test_app();
-    let (events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let (events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, Modifiers::NONE);
 
     app.update(Msg::Key(key(KeyCode::Char(TYPED))));
 
@@ -5265,8 +5265,8 @@ fn a_key_no_popup_claimed_still_reaches_the_chat_input() {
 fn a_modal_opened_over_a_popup_outranks_the_keys_it_claimed() {
     let mut app = test_app();
     let claims = [
-        (KeyCode::Enter, KeyModifiers::NONE),
-        (KeyCode::Esc, KeyModifiers::NONE),
+        (KeyCode::Enter, Modifiers::NONE),
+        (KeyCode::Escape, Modifiers::NONE),
     ];
     let (events, _cmd_tx) = open_claiming_popup_keys(&mut app, &claims);
 
@@ -5293,8 +5293,8 @@ fn a_modal_opened_over_a_popup_outranks_the_keys_it_claimed() {
 fn the_command_palette_outranks_the_keys_a_popup_claimed() {
     let mut app = test_app();
     let claims = [
-        (KeyCode::Enter, KeyModifiers::NONE),
-        (KeyCode::Tab, KeyModifiers::NONE),
+        (KeyCode::Enter, Modifiers::NONE),
+        (KeyCode::Tab, Modifiers::NONE),
     ];
     let (events, _cmd_tx) = open_claiming_popup_keys(&mut app, &claims);
 
@@ -5322,7 +5322,7 @@ fn the_command_palette_outranks_the_keys_a_popup_claimed() {
 fn a_popup_that_closed_gives_its_keys_back() {
     let mut app = test_app();
     let mode = app.state.mode;
-    let (_events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+    let (_events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Tab, Modifiers::NONE);
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(app.state.mode, mode, "the popup had the key");
@@ -5358,9 +5358,9 @@ fn streaming_cancel_wins_over_esc_override() {
     app.run_id = 1;
     app.status_bar.flash_duration = Duration::from_secs(3600);
     app.last_esc = Some(Instant::now());
-    let probe = install_override(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    let probe = install_override(&mut app, KeyCode::Escape, Modifiers::NONE);
 
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Escape)));
 
     assert!(
         matches!(&actions[0], Action::CancelAgent { .. }),
@@ -5384,9 +5384,9 @@ fn a_popup_claiming_esc_closes_before_the_streaming_cancel_is_armed() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
-    let (events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    let (events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Escape, Modifiers::NONE);
 
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Escape)));
 
     assert!(actions.is_empty(), "the popup took the Esc");
     assert!(took_a_key(&events), "{CLAIM_DELIVERED}");
@@ -5400,7 +5400,7 @@ fn a_popup_claiming_esc_closes_before_the_streaming_cancel_is_armed() {
     // back for the press the user was reaching for.
     drop(cmd_tx);
     let _ = app.float_mgr.tick();
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Key(key(KeyCode::Escape)));
 
     assert!(app.last_esc.is_some(), "the second Esc arms the cancel");
     assert_eq!(app.status, Status::Streaming, "and not in one press");
@@ -5414,7 +5414,7 @@ fn the_first_esc_arms_the_streaming_cancel_with_no_popup_up() {
     app.status = Status::Streaming;
     app.run_id = 1;
 
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Key(key(KeyCode::Escape)));
 
     assert!(app.last_esc.is_some(), "the cancel is armed");
     assert_eq!(app.status, Status::Streaming, "and not taken in one press");
@@ -6377,7 +6377,7 @@ fn split_question_keeps_transcript_selectable_and_keyboard_focus(dir: Split) {
     assert!(
         event_rx
             .try_iter()
-            .any(|event| matches!(event, WinEvent::Key { key } if key == plugin_key(KeyCode::Char('j'), KeyModifiers::NONE)))
+            .any(|event| matches!(event, WinEvent::Key { key } if key == plugin_key(KeyCode::Char('j'), Modifiers::NONE)))
     );
     assert!(app.input_box.is_empty());
     assert!(app.awaiting_input());
@@ -6490,7 +6490,7 @@ fn app_with_active_subagent() -> App {
 fn double_esc_in_subagent_cancels_subagent() {
     let mut app = app_with_active_subagent();
     app.last_esc = Some(Instant::now());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Escape)));
     assert_eq!(actions.len(), 1);
     assert!(matches!(
         &actions[0],
@@ -6503,12 +6503,12 @@ fn double_esc_in_subagent_cancels_subagent() {
 #[test]
 fn single_or_stale_esc_in_subagent_flashes() {
     let mut app = app_with_active_subagent();
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Escape)));
     assert!(actions.is_empty());
     assert_eq!(app.status_bar.flash_text().unwrap(), FLASH_CANCEL);
 
     app.last_esc = Some(Instant::now().checked_sub(Duration::from_secs(10)).unwrap());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Escape)));
     assert!(actions.is_empty());
     assert!(!app.chats[1].is_finished());
 }
@@ -6518,7 +6518,7 @@ fn esc_in_main_chat_with_active_subagent_no_cancel() {
     let mut app = app_with_subagent();
     assert_eq!(app.active_chat, 0);
     app.last_esc = Some(Instant::now());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Escape)));
     assert_eq!(actions.len(), 1);
     assert!(matches!(&actions[0], Action::CancelAgent { .. }));
     assert!(!matches!(&actions[0], Action::CancelSubagent { .. }));
@@ -6531,7 +6531,7 @@ fn cancel_subagent_removes_answer_sender() {
     app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
     app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Key(key(KeyCode::Escape)));
     assert!(!app.subagent_answers.contains_key(TASK_ID));
 }
 
@@ -6547,7 +6547,7 @@ fn multiple_subagents_cancel_one_other_unaffected() {
 
     app.active_chat = *app.chat_index.get("task2").unwrap();
     app.last_esc = Some(Instant::now());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Escape)));
 
     assert_eq!(actions.len(), 1);
     assert!(matches!(
@@ -6564,7 +6564,7 @@ fn double_esc_in_finished_subagent_noop() {
     let mut app = app_with_active_subagent();
     finish_subagent_task(&mut app, false);
     app.last_esc = Some(Instant::now());
-    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    let actions = app.update(Msg::Key(key(KeyCode::Escape)));
     assert!(actions.is_empty());
 }
 
@@ -6572,7 +6572,7 @@ fn double_esc_in_finished_subagent_noop() {
 fn subagent_cancel_then_navigate_back_main_unaffected() {
     let mut app = app_with_active_subagent();
     app.last_esc = Some(Instant::now());
-    app.update(Msg::Key(key(KeyCode::Esc)));
+    app.update(Msg::Key(key(KeyCode::Escape)));
     assert!(app.chats[1].is_finished());
 
     app.run_builtin(BuiltinAction::PrevChat);
@@ -7330,9 +7330,9 @@ fn alt_m_opens_model_picker() {
     let mut app = test_app();
     let key = KeyEvent {
         code: KeyCode::Char('m'),
-        modifiers: KeyModifiers::CONTROL,
-        kind: crossterm::event::KeyEventKind::Press,
-        state: crossterm::event::KeyEventState::NONE,
+        modifiers: Modifiers::CONTROL,
+        kind: termina::event::KeyEventKind::Press,
+        state: termina::event::KeyEventState::NONE,
     };
     app.update(Msg::Key(key));
     assert!(app.model_picker.is_open());

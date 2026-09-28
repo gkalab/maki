@@ -1,5 +1,5 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use strum::EnumIter;
+use termina::event::{KeyCode, KeyEvent, Modifiers};
 use unicode_width::UnicodeWidthStr;
 
 macro_rules! mod_key {
@@ -93,7 +93,7 @@ macro_rules! ctrl_bind {
     ($char:tt) => {
         Bind {
             code: KeyCode::Char($char),
-            modifiers: KeyModifiers::CONTROL,
+            modifiers: Modifiers::CONTROL,
             label: mod_key!(upper!($char)),
         }
     };
@@ -102,7 +102,7 @@ macro_rules! ctrl_bind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bind {
     pub code: KeyCode,
-    pub modifiers: KeyModifiers,
+    pub modifiers: Modifiers,
     pub label: &'static str,
 }
 
@@ -116,15 +116,15 @@ impl Bind {
         KeyEvent {
             code: self.code,
             modifiers: self.modifiers,
-            kind: crossterm::event::KeyEventKind::Press,
-            state: crossterm::event::KeyEventState::NONE,
+            kind: termina::event::KeyEventKind::Press,
+            state: termina::event::KeyEventState::NONE,
         }
     }
 }
 
 pub mod key {
     use super::Bind;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use termina::event::{KeyCode, Modifiers};
 
     pub const QUIT: Bind = ctrl_bind!('c');
     pub const HELP: Bind = ctrl_bind!('h');
@@ -133,12 +133,12 @@ pub mod key {
     pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!('d');
     pub const SCROLL_PAGE_UP: Bind = Bind {
         code: KeyCode::PageUp,
-        modifiers: KeyModifiers::NONE,
+        modifiers: Modifiers::NONE,
         label: "PageUp",
     };
     pub const SCROLL_PAGE_DOWN: Bind = Bind {
         code: KeyCode::PageDown,
-        modifiers: KeyModifiers::NONE,
+        modifiers: Modifiers::NONE,
         label: "PageDown",
     };
     pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y');
@@ -160,7 +160,7 @@ pub mod key {
     pub const LINE_END: Bind = ctrl_bind!('e');
     pub const EDIT_INPUT: Bind = Bind {
         code: KeyCode::Char('o'),
-        modifiers: KeyModifiers::ALT,
+        modifiers: Modifiers::ALT,
         label: "Alt+O",
     };
 }
@@ -561,17 +561,14 @@ pub fn all_contexts() -> impl Iterator<Item = KeybindContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyEvent;
+    use termina::event::KeyEvent;
 
     #[test]
     fn bind_requires_exact_modifiers() {
         let bind = key::OPEN_EDITOR; // Ctrl+O
-        let exact = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
-        let extra = KeyEvent::new(
-            KeyCode::Char('o'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        );
-        let wrong = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT);
+        let exact = KeyEvent::new(KeyCode::Char('o'), Modifiers::CONTROL);
+        let extra = KeyEvent::new(KeyCode::Char('o'), Modifiers::CONTROL | Modifiers::SHIFT);
+        let wrong = KeyEvent::new(KeyCode::Char('o'), Modifiers::ALT);
 
         assert!(bind.matches(exact));
         assert!(!bind.matches(extra), "extra modifiers should not match");

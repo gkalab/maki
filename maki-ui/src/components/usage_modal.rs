@@ -3,7 +3,6 @@ use std::collections::HashMap;
 
 use arc_swap::ArcSwapOption;
 
-use crossterm::event::{KeyCode, KeyEvent};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use maki_config::ClockFormat;
@@ -14,6 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use termina::event::{KeyCode, KeyEvent};
 
 use crate::components::ModalScroll;
 use crate::components::keybindings::key;
@@ -101,7 +101,7 @@ impl UsageModal {
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) {
-        if key_event.code == KeyCode::Esc || key::QUIT.matches(key_event) {
+        if key_event.code == KeyCode::Escape || key::QUIT.matches(key_event) {
             self.close();
         }
         self.scroll.handle_key(key_event);
@@ -467,9 +467,9 @@ mod tests {
     use super::*;
     use crate::components::{buffer_text, test_model};
     use crate::repaint::expect::{OWED, QUIET};
-    use crossterm::event::KeyModifiers;
     use maki_providers::UsageLimit;
     use std::sync::Arc;
+    use termina::event::Modifiers;
     use test_case::test_case;
 
     const RECORDED_COST: f64 = 0.123;
@@ -489,12 +489,12 @@ mod tests {
             .collect()
     }
 
-    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+    fn key(code: KeyCode, mods: Modifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
     }
 
-    #[test_case(key(KeyCode::Esc, KeyModifiers::NONE) ; "esc_closes")]
-    #[test_case(key(KeyCode::Char('c'), KeyModifiers::CONTROL) ; "ctrl_c_closes")]
+    #[test_case(key(KeyCode::Escape, Modifiers::NONE) ; "esc_closes")]
+    #[test_case(key(KeyCode::Char('c'), Modifiers::CONTROL) ; "ctrl_c_closes")]
     fn handle_key_closes(k: KeyEvent) {
         let mut modal = UsageModal::new();
         modal.toggle();
@@ -517,7 +517,7 @@ mod tests {
     fn handle_key_ignores_arbitrary() {
         let mut modal = UsageModal::new();
         modal.toggle();
-        modal.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE));
+        modal.handle_key(key(KeyCode::Char('a'), Modifiers::NONE));
         assert!(modal.is_open());
     }
 

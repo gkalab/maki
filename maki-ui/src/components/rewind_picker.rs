@@ -2,10 +2,10 @@ use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
 
-use crossterm::event::KeyEvent;
 use maki_providers::{Message, Role};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
+use termina::event::KeyEvent;
 
 const TITLE: &str = " Rewind ";
 const PREVIEW_MAX_LEN: usize = 80;

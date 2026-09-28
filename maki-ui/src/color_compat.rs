@@ -195,7 +195,7 @@ mod probe {
 
 #[cfg(not(unix))]
 mod probe {
-    /// No tty to poke on non-unix. Windows Terminal does RGB and crossterm
+    /// No tty to poke on non-unix. Windows Terminal does RGB and the backend
     /// maps colors for the legacy console, so assuming truecolor is safe.
     pub(super) fn terminal_supports_rgb() -> bool {
         true

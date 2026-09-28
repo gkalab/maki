@@ -13,12 +13,12 @@ use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
-use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use termina::event::{KeyCode, KeyEvent};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NO_MATCHES: &str = "No matches";
@@ -395,7 +395,7 @@ impl<T: PickerItem> ListPicker<T> {
                     None => PickerAction::Consumed,
                 }
             }
-            KeyCode::Esc => {
+            KeyCode::Escape => {
                 self.state = None;
                 PickerAction::Close
             }
@@ -815,7 +815,7 @@ mod tests {
     use super::*;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
-    use crossterm::event::KeyCode;
+    use termina::event::KeyCode;
     use test_case::test_case;
 
     fn ready_state<T>(p: &ListPicker<T>) -> &State<T> {
@@ -1006,7 +1006,7 @@ mod tests {
         assert_eq!(width_percent(screen_width), expected);
     }
 
-    #[test_case(key(KeyCode::Esc) ; "esc_returns_close")]
+    #[test_case(key(KeyCode::Escape) ; "esc_returns_close")]
     #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_returns_close")]
     fn cancel_returns_close(cancel_key: KeyEvent) {
         let mut p = ListPicker::new();

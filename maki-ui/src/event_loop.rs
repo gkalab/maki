@@ -15,9 +15,6 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
-use crossterm::event::{
-    Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
-};
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
@@ -45,6 +42,10 @@ use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
+use termina::EventReader;
+use termina::event::{
+    Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
+};
 use tracing::{info, warn};
 
 use crate::agent::{
@@ -468,7 +469,7 @@ impl SpawnCtx {
 }
 
 pub(crate) struct EventLoop<'t> {
-    terminal: &'t mut ratatui::DefaultTerminal,
+    guard: &'t mut terminal::TerminalGuard,
     sessions: Vec<SessionRuntime>,
     focused: usize,
     /// The `(session, task)` pair whose transcript was on screen last frame.
@@ -584,7 +585,8 @@ fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
 
 impl<'t> EventLoop<'t> {
     pub(crate) fn new(
-        terminal: &'t mut ratatui::DefaultTerminal,
+        guard: &'t mut terminal::TerminalGuard,
+        reader: EventReader,
         params: EventLoopParams,
     ) -> Result<Self> {
         let EventLoopParams {
@@ -708,7 +710,7 @@ impl<'t> EventLoop<'t> {
 
         let (pack_tx, pack_rx) = flume::unbounded();
         Ok(Self {
-            terminal,
+            guard,
             sessions: runtimes,
             focused,
             last_focus: None,
@@ -716,7 +718,7 @@ impl<'t> EventLoop<'t> {
             notifier,
             ctx,
             slots,
-            input: InputReader::spawn(),
+            input: InputReader::spawn(reader),
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
             models_rx: bg.models_rx,
@@ -748,14 +750,14 @@ impl<'t> EventLoop<'t> {
     fn paint(&mut self) -> Result<()> {
         let app = &mut self.sessions[self.focused].app;
         let mut cursor = None;
-        self.terminal.draw(|f| {
+        self.guard.terminal.draw(|f| {
             cursor = app.view(f);
             color_compat::downgrade_if_needed(f.buffer_mut());
         })?;
         if let Some(pos) = cursor {
-            self.terminal.hide_cursor()?;
-            self.terminal.set_cursor_position(pos)?;
-            self.terminal.backend_mut().flush()?;
+            self.guard.terminal.hide_cursor()?;
+            self.guard.terminal.set_cursor_position(pos)?;
+            self.guard.terminal.backend_mut().flush()?;
         }
         Ok(())
     }
@@ -1045,7 +1047,7 @@ impl<'t> EventLoop<'t> {
     fn open_editor(&mut self, idx: usize, path: &std::path::Path) -> i32 {
         let result = {
             let _pause = self.input.pause();
-            terminal::open_in_editor(path, self.terminal)
+            terminal::open_in_editor(path, self.guard)
         };
         self.focus.on_resume();
         match result {
@@ -1325,7 +1327,12 @@ impl<'t> EventLoop<'t> {
         match req {
             InputRequest::Read => Ok(self.focused_app().input_snapshot()),
             InputRequest::Edit(edit) => {
-                let area = self.terminal.size().map(Rect::from).unwrap_or_default();
+                let area = self
+                    .guard
+                    .terminal
+                    .size()
+                    .map(Rect::from)
+                    .unwrap_or_default();
                 self.focused_app().apply_input_edit(edit, area)
             }
         }
@@ -1500,11 +1507,11 @@ impl<'t> EventLoop<'t> {
 
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
         match raw {
-            Event::FocusGained => {
+            Event::FocusIn => {
                 self.focus.report(Focus::Focused);
                 (None, None)
             }
-            Event::FocusLost => {
+            Event::FocusOut => {
                 self.focus.report(Focus::Unfocused);
                 (None, None)
             }
@@ -1719,7 +1726,7 @@ impl<'t> EventLoop<'t> {
                 let current_text = self.sessions[idx].app.input_box.buffer.value();
                 let result = {
                     let _pause = self.input.pause();
-                    terminal::edit_temp_content(&current_text, self.terminal)
+                    terminal::edit_temp_content(&current_text, self.guard)
                 };
                 self.focus.on_resume();
                 match result {
@@ -1738,7 +1745,7 @@ impl<'t> EventLoop<'t> {
             Action::PreparePack(command) => self.start_pack(idx, command),
             Action::Suspend => {
                 let _pause = self.input.pause();
-                terminal::suspend(self.terminal);
+                self.guard.suspend();
                 self.focus.on_resume();
             }
             Action::RefreshModels => self.refresh_models(),

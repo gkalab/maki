@@ -31,12 +31,12 @@ pub(crate) mod usage_modal;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, ToolInput, ToolOutput};
 use maki_lua::{PackCommand, PackPlan};
 use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::text::{Line, Span};
+use termina::event::{KeyCode, KeyEvent, Modifiers};
 
 pub(crate) use maki_providers::IMAGE_PLACEHOLDER;
 
@@ -86,7 +86,7 @@ pub(crate) fn apply_scroll_delta(offset: u16, delta: i32) -> u16 {
 }
 
 pub fn is_ctrl(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
+    key.modifiers.contains(Modifiers::CONTROL) && !key.modifiers.contains(Modifiers::ALT)
 }
 
 pub(crate) struct ModalScroll {
@@ -429,12 +429,12 @@ pub(crate) fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
-    crossterm::event::KeyEvent {
+pub(crate) fn key(code: termina::event::KeyCode) -> termina::event::KeyEvent {
+    termina::event::KeyEvent {
         code,
-        modifiers: crossterm::event::KeyModifiers::NONE,
-        kind: crossterm::event::KeyEventKind::Press,
-        state: crossterm::event::KeyEventState::NONE,
+        modifiers: termina::event::Modifiers::NONE,
+        kind: termina::event::KeyEventKind::Press,
+        state: termina::event::KeyEventState::NONE,
     }
 }
 

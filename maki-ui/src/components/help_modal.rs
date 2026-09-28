@@ -7,11 +7,11 @@ use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::theme;
 
-use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use termina::event::{KeyCode, KeyEvent};
 use unicode_width::UnicodeWidthStr;
 
 const TITLE: &str = " Keybindings ";
@@ -104,7 +104,7 @@ impl HelpModal {
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
-        let close = key_event.code == KeyCode::Esc
+        let close = key_event.code == KeyCode::Escape
             || key::HELP.matches(key_event)
             || key::QUIT.matches(key_event);
         if close {
@@ -236,10 +236,10 @@ impl Overlay for HelpModal {
 mod tests {
     use super::*;
     use crate::components::key as key_ev;
-    use crossterm::event::KeyCode;
+    use termina::event::KeyCode;
     use test_case::test_case;
 
-    #[test_case(key_ev(KeyCode::Esc)       ; "esc_closes")]
+    #[test_case(key_ev(KeyCode::Escape)       ; "esc_closes")]
     #[test_case(key::QUIT.to_key_event()    ; "ctrl_c_closes")]
     #[test_case(key::HELP.to_key_event()    ; "ctrl_h_closes")]
     fn handle_key_closes(k: KeyEvent) {

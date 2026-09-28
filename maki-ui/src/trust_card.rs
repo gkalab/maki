@@ -6,18 +6,18 @@
 //! screen, so the main UI opens over it and a declined question stays in
 //! scrollback.
 
-use std::io::{self, stdout};
+use std::io::{self, Write};
 use std::process::exit;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use crossterm::terminal;
 use maki_config::project::{TRUST_DOCS, TrustAnswer, TrustQuestion, trust_question_lines};
-use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::backend::{Backend, TerminaBackend};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use termina::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use termina::{EventReader, PlatformTerminal, Terminal as _};
 
 use crate::components::{hint_line, is_ctrl};
 use crate::theme;
@@ -97,7 +97,7 @@ impl TrustCard {
     fn handle_key(&mut self, key: KeyEvent) -> Option<TrustAnswer> {
         match key.code {
             KeyCode::Char('t' | 'T' | 'y' | 'Y') => Some(TrustAnswer::Trust),
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(TrustAnswer::NotNow),
+            KeyCode::Char('n' | 'N') | KeyCode::Escape => Some(TrustAnswer::NotNow),
             KeyCode::Enter => Some(CHOICES[self.selected].answer),
             KeyCode::Up | KeyCode::BackTab => {
                 self.selected = (self.selected + CHOICES.len() - 1) % CHOICES.len();
@@ -172,54 +172,66 @@ impl TrustCard {
 }
 
 fn draw_and_read(card: &mut TrustCard) -> io::Result<TrustAnswer> {
-    let width = terminal::size().map_or(FALLBACK_WIDTH, |(width, _)| width);
+    // The control handle stays out of the backend so raw/cooked mode can be
+    // toggled after the backend took ownership of the drawing handle.
+    let mut control = PlatformTerminal::new()?;
+    let terminal = PlatformTerminal::new()?;
+    let reader = terminal.event_reader();
+    let width = terminal.get_dimensions().map_or(FALLBACK_WIDTH, |d| d.cols);
     let height = card.height(width);
-    terminal::enable_raw_mode()?;
-    let result = run(card, height);
-    terminal::disable_raw_mode().ok();
+    control.enter_raw_mode()?;
+    let result = run(&mut control, terminal, reader, card, height);
+    control.enter_cooked_mode().ok();
+    control.flush().ok();
     result
 }
 
-fn run(card: &mut TrustCard, height: u16) -> io::Result<TrustAnswer> {
-    let mut terminal = Terminal::with_options(
-        CrosstermBackend::new(stdout()),
+fn run(
+    control: &mut PlatformTerminal,
+    terminal: PlatformTerminal,
+    reader: EventReader,
+    card: &mut TrustCard,
+    height: u16,
+) -> io::Result<TrustAnswer> {
+    let mut ratatui = Terminal::with_options(
+        TerminaBackend::new(terminal),
         TerminalOptions {
             viewport: Viewport::Inline(height),
         },
     )?;
-    terminal.hide_cursor()?;
+    ratatui.hide_cursor()?;
 
     let answer = loop {
-        terminal.draw(|frame| card.view(frame, frame.area()))?;
-        match event::read()? {
+        ratatui.draw(|frame| card.view(frame, frame.area()))?;
+        match reader.read(|_| true)? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if is_ctrl(&key) && matches!(key.code, KeyCode::Char('c' | 'C')) {
-                    terminal.show_cursor().ok();
-                    terminal::disable_raw_mode().ok();
+                    ratatui.show_cursor().ok();
+                    control.enter_cooked_mode().ok();
                     exit(INTERRUPTED_EXIT_CODE);
                 }
                 if let Some(answer) = card.handle_key(key) {
                     break answer;
                 }
             }
-            Event::Resize(..) => terminal.autoresize()?,
+            Event::WindowResized(..) => ratatui.autoresize()?,
             _ => {}
         }
     };
 
-    terminal.draw(|frame| card.view(frame, frame.area()))?;
-    terminal.show_cursor()?;
+    ratatui.draw(|frame| card.view(frame, frame.area()))?;
+    ratatui.show_cursor()?;
     // Leaves the answered card above the cursor, so the shell prompt after the
     // session does not land on top of it.
-    terminal.backend_mut().append_lines(height)?;
+    ratatui.backend_mut().append_lines(height)?;
     Ok(answer)
 }
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::KeyModifiers;
     use maki_config::project::GatedFile;
     use maki_storage::trusted_folders::CanonicalFolder;
+    use termina::event::Modifiers;
     use test_case::test_case;
 
     use super::*;
@@ -236,13 +248,13 @@ mod tests {
     }
 
     fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
+        KeyEvent::new(code, Modifiers::NONE)
     }
 
     #[test_case(KeyCode::Char('t'), TrustAnswer::Trust ; "t_trusts")]
     #[test_case(KeyCode::Char('y'), TrustAnswer::Trust ; "y_trusts")]
     #[test_case(KeyCode::Char('n'), TrustAnswer::NotNow ; "n_defers")]
-    #[test_case(KeyCode::Esc, TrustAnswer::NotNow ; "esc_defers")]
+    #[test_case(KeyCode::Escape, TrustAnswer::NotNow ; "esc_defers")]
     #[test_case(KeyCode::Enter, TrustAnswer::NotNow ; "enter_takes_the_safe_default")]
     fn a_key_answers_the_question(code: KeyCode, expected: TrustAnswer) {
         assert_eq!(card().handle_key(press(code)), Some(expected));
@@ -277,7 +289,7 @@ mod tests {
     /// caller could record.
     #[test]
     fn ctrl_c_is_not_an_answer() {
-        let key = KeyEvent::new(KeyCode::Char(CTRL_C), KeyModifiers::CONTROL);
+        let key = KeyEvent::new(KeyCode::Char(CTRL_C), Modifiers::CONTROL);
 
         assert_eq!(card().handle_key(key), None);
     }

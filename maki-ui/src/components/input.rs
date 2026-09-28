@@ -7,9 +7,9 @@ use crate::highlight;
 use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
 use crate::theme;
 
-use crossterm::event::{KeyCode, KeyEvent};
 use maki_storage::input_history::InputHistory;
 use std::mem;
+use termina::event::{KeyCode, KeyEvent};
 
 use maki_providers::ImageSource;
 use ratatui::Frame;
@@ -108,7 +108,7 @@ impl InputBox {
                 self.history_down();
                 return InputAction::None;
             }
-            KeyCode::Tab | KeyCode::Esc => return InputAction::Passthrough(key),
+            KeyCode::Tab | KeyCode::Escape => return InputAction::Passthrough(key),
             _ if is_newline_key(&key) => {
                 self.buffer.add_line();
                 return InputAction::ContinueLine;

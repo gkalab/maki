@@ -5,8 +5,8 @@ use crate::selection::{
     self, ContentRegion, DocPos, EdgeScroll, RowPos, ScreenSelection, Selection, SelectionState,
     SelectionZone,
 };
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use termina::event::{MouseButton, MouseEvent, MouseEventKind};
 
 use crate::image;
 use crate::repaint::Dirty;

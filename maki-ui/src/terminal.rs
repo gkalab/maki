@@ -5,17 +5,13 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
-use crossterm::Command;
-use crossterm::ExecutableCommand;
-use crossterm::clipboard::CopyToClipboard;
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-#[cfg(not(windows))]
-use crossterm::event::{DisableFocusChange, EnableFocusChange};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use maki_config::NotificationMethod;
+use ratatui::backend::TerminaBackend;
+use termina::escape::csi::{
+    Csi, DecPrivateMode, DecPrivateModeCode, Keyboard, KittyKeyboardFlags, Mode,
+};
+use termina::escape::osc::{Osc, Selection};
+use termina::{EventReader, PlatformHandle, PlatformTerminal, Terminal as _};
 
 const FALLBACK_NOTIFICATION_MESSAGE: &str = "Maki needs attention";
 const BELL_SEQUENCE: &str = "\u{7}";
@@ -28,7 +24,125 @@ const POP_WINDOW_TITLE_SEQUENCE: &str = "\u{1b}[23;2t";
 /// must not be able to hang startup with Ctrl-C disabled.
 const TMUX_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 
-pub(crate) struct TerminalGuard;
+type AppTerminal = ratatui::Terminal<TerminaBackend<PlatformTerminal>>;
+
+const MOUSE_MODES: &[DecPrivateModeCode] = &[
+    DecPrivateModeCode::MouseTracking,
+    DecPrivateModeCode::ButtonEventMouse,
+    DecPrivateModeCode::AnyEventMouse,
+    DecPrivateModeCode::SGRMouse,
+    DecPrivateModeCode::RXVTMouse,
+];
+
+/// The OSC 52 the host writes for every copy; the mux layer wraps it.
+fn clipboard_osc(text: &str) -> String {
+    Osc::SetSelection(Selection::CLIPBOARD, text).to_string()
+}
+
+fn set_dec_private_mode(code: DecPrivateModeCode, enable: bool) -> String {
+    let mode = DecPrivateMode::Code(code);
+    Csi::Mode(if enable {
+        Mode::SetDecPrivateMode(mode)
+    } else {
+        Mode::ResetDecPrivateMode(mode)
+    })
+    .to_string()
+}
+
+fn write_mouse_modes(enable: bool) {
+    for &code in MOUSE_MODES {
+        let _ = write_sequence(&set_dec_private_mode(code, enable));
+    }
+}
+
+fn write_bracketed_paste(enable: bool) {
+    let _ = write_sequence(&set_dec_private_mode(
+        DecPrivateModeCode::BracketedPaste,
+        enable,
+    ));
+}
+
+fn write_alternate_screen(enable: bool) {
+    let _ = write_sequence(&set_dec_private_mode(
+        DecPrivateModeCode::ClearAndEnableAlternateScreen,
+        enable,
+    ));
+}
+
+fn write_cursor_visible(visible: bool) {
+    let _ = write_sequence(&set_dec_private_mode(
+        DecPrivateModeCode::ShowCursor,
+        visible,
+    ));
+}
+
+#[cfg(not(windows))]
+fn write_focus_tracking(enable: bool) {
+    let _ = write_sequence(&set_dec_private_mode(
+        DecPrivateModeCode::FocusTracking,
+        enable,
+    ));
+}
+
+#[cfg(windows)]
+fn write_focus_tracking(_enable: bool) {}
+
+fn write_sequence_to(writer: &mut impl Write, sequence: &str) {
+    let _ = writer.write_all(sequence.as_bytes());
+}
+
+fn pop_terminal_modes_to(writer: &mut impl Write) {
+    write_sequence_to(
+        writer,
+        &TerminalMux::detect().wrap_for_mux(POP_WINDOW_TITLE_SEQUENCE.into()),
+    );
+    write_sequence_to(
+        writer,
+        &set_dec_private_mode(DecPrivateModeCode::ShowCursor, true),
+    );
+    write_sequence_to(writer, &Csi::Keyboard(Keyboard::PopFlags(1)).to_string());
+    #[cfg(not(windows))]
+    write_sequence_to(
+        writer,
+        &set_dec_private_mode(DecPrivateModeCode::FocusTracking, false),
+    );
+    for &code in MOUSE_MODES {
+        write_sequence_to(writer, &set_dec_private_mode(code, false));
+    }
+    write_sequence_to(
+        writer,
+        &set_dec_private_mode(DecPrivateModeCode::BracketedPaste, false),
+    );
+    let _ = writer.flush();
+}
+
+fn restore_terminal_to(writer: &mut impl Write) {
+    pop_terminal_modes_to(writer);
+    write_sequence_to(
+        writer,
+        &set_dec_private_mode(DecPrivateModeCode::ClearAndEnableAlternateScreen, false),
+    );
+    let _ = writer.flush();
+}
+
+fn panic_hook(handle: &mut PlatformHandle) {
+    restore_terminal_to(handle);
+}
+
+/// The controlling terminal's full dimensions, without a live terminal handle.
+pub(crate) fn terminal_window() -> Option<termina::WindowSize> {
+    PlatformTerminal::new().ok()?.get_dimensions().ok()
+}
+
+/// The controlling terminal's size in cells, without a live terminal handle.
+pub(crate) fn terminal_size() -> Option<(u16, u16)> {
+    terminal_window().map(|d| (d.cols, d.rows))
+}
+
+pub(crate) struct TerminalGuard {
+    pub(crate) terminal: AppTerminal,
+    control: PlatformTerminal,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalMux {
@@ -268,22 +382,60 @@ impl TerminalMux {
 }
 
 impl TerminalGuard {
-    pub(crate) fn init() -> Result<(Self, ratatui::DefaultTerminal)> {
-        let terminal = ratatui::init();
+    pub(crate) fn init() -> Result<(Self, EventReader)> {
+        let control = PlatformTerminal::new()?;
+        let mut terminal = PlatformTerminal::new()?;
+        terminal.set_panic_hook(panic_hook);
+        terminal.enter_raw_mode()?;
         write_mux_sequence(PUSH_WINDOW_TITLE_SEQUENCE);
-        stdout().execute(EnableBracketedPaste)?;
-        stdout().execute(EnableMouseCapture)?;
-        enable_focus_change();
+        write_alternate_screen(true);
+        write_bracketed_paste(true);
+        write_mouse_modes(true);
+        write_focus_tracking(true);
+        write_cursor_visible(false);
         push_keyboard_enhancement();
-        Ok((Self, terminal))
+        let reader = terminal.event_reader();
+        let terminal = ratatui::Terminal::new(TerminaBackend::new(terminal))?;
+        Ok((Self { terminal, control }, reader))
+    }
+
+    fn teardown(&mut self) {
+        self.pop_terminal_modes();
+        self.control.enter_cooked_mode().ok();
+        write_alternate_screen(false);
+        self.control.flush().ok();
+    }
+
+    fn resume(&mut self) {
+        crate::terminal_image::invalidate();
+        write_mux_sequence(PUSH_WINDOW_TITLE_SEQUENCE);
+        write_alternate_screen(true);
+        write_bracketed_paste(true);
+        write_mouse_modes(true);
+        write_focus_tracking(true);
+        self.control.enter_raw_mode().ok();
+        push_keyboard_enhancement();
+        let _ = self.terminal.clear();
+    }
+
+    fn pop_terminal_modes(&mut self) {
+        pop_terminal_modes_to(&mut stdout().lock());
+    }
+
+    pub(crate) fn suspend(&mut self) {
+        self.teardown();
+        #[cfg(unix)]
+        unsafe {
+            libc::raise(libc::SIGTSTP);
+        }
+        self.resume();
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let started = Instant::now();
-        pop_terminal_modes();
-        ratatui::restore();
+        self.teardown();
         tracing::info!(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "terminal restored"
@@ -291,70 +443,18 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub(crate) fn suspend(terminal: &mut ratatui::DefaultTerminal) {
-    teardown();
-    #[cfg(unix)]
-    unsafe {
-        libc::raise(libc::SIGTSTP);
-    }
-    resume(terminal);
-}
-
-fn teardown() {
-    pop_terminal_modes();
-    terminal::disable_raw_mode().ok();
-    stdout().execute(LeaveAlternateScreen).ok();
-    stdout().flush().ok();
-}
-
-fn pop_terminal_modes() {
-    write_mux_sequence(POP_WINDOW_TITLE_SEQUENCE);
-    stdout().execute(crossterm::cursor::Show).ok();
-    stdout().execute(PopKeyboardEnhancementFlags).ok();
-    disable_focus_change();
-    stdout().execute(DisableMouseCapture).ok();
-    stdout().execute(DisableBracketedPaste).ok();
-}
-
-fn resume(terminal: &mut ratatui::DefaultTerminal) {
-    crate::terminal_image::invalidate();
-    write_mux_sequence(PUSH_WINDOW_TITLE_SEQUENCE);
-    stdout().execute(EnterAlternateScreen).ok();
-    stdout().execute(EnableBracketedPaste).ok();
-    stdout().execute(EnableMouseCapture).ok();
-    enable_focus_change();
-    terminal::enable_raw_mode().ok();
-    push_keyboard_enhancement();
-    let _ = terminal.clear();
-}
-
-#[cfg(not(windows))]
-fn enable_focus_change() {
-    stdout().execute(EnableFocusChange).ok();
-}
-
-#[cfg(windows)]
-fn enable_focus_change() {}
-
-#[cfg(not(windows))]
-fn disable_focus_change() {
-    stdout().execute(DisableFocusChange).ok();
-}
-
-#[cfg(windows)]
-fn disable_focus_change() {}
-
 fn push_keyboard_enhancement() {
-    if let Err(e) = stdout().execute(PushKeyboardEnhancementFlags(
-        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-    )) {
+    let seq = Csi::Keyboard(Keyboard::PushFlags(
+        KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+    ));
+    if let Err(e) = write_sequence(&seq.to_string()) {
         tracing::warn!(error = %e, "failed to enable keyboard enhancement (Kitty protocol)");
     }
 }
 
 pub(crate) fn edit_temp_content(
     content: &str,
-    terminal: &mut ratatui::DefaultTerminal,
+    guard: &mut TerminalGuard,
 ) -> Result<String, String> {
     let tmp = tempfile::Builder::new()
         .prefix("maki-input-")
@@ -364,15 +464,12 @@ pub(crate) fn edit_temp_content(
 
     std::fs::write(tmp.path(), content).map_err(|e| format!("Failed to write temp file: {e}"))?;
 
-    open_in_editor(tmp.path(), terminal)?;
+    open_in_editor(tmp.path(), guard)?;
 
     std::fs::read_to_string(tmp.path()).map_err(|e| format!("Failed to read edited content: {e}"))
 }
 
-pub(crate) fn open_in_editor(
-    path: &Path,
-    terminal: &mut ratatui::DefaultTerminal,
-) -> Result<i32, String> {
+pub(crate) fn open_in_editor(path: &Path, guard: &mut TerminalGuard) -> Result<i32, String> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .map_err(|_| "Set $VISUAL or $EDITOR to open files".to_string())?;
@@ -383,7 +480,7 @@ pub(crate) fn open_in_editor(
         return Err("Empty $VISUAL or $EDITOR".to_string());
     }
 
-    teardown();
+    guard.teardown();
 
     let result = std::process::Command::new(&args[0])
         .args(&args[1..])
@@ -393,7 +490,7 @@ pub(crate) fn open_in_editor(
         .stderr(std::process::Stdio::inherit())
         .status();
 
-    resume(terminal);
+    guard.resume();
 
     match result {
         Ok(status) => Ok(status.code().unwrap_or(-1)),
@@ -404,11 +501,7 @@ pub(crate) fn open_in_editor(
 }
 
 pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    let mut sequence = String::new();
-    CopyToClipboard::to_clipboard_from(text)
-        .write_ansi(&mut sequence)
-        .map_err(|e| e.to_string())?;
-    let sequence = TerminalMux::detect().wrap_for_mux(sequence);
+    let sequence = TerminalMux::detect().wrap_for_mux(clipboard_osc(text));
     let mut stdout = stdout().lock();
     stdout
         .write_all(sequence.as_bytes())
@@ -465,7 +558,7 @@ mod tests {
         }
     }
 
-    // Uses the ST terminator that crossterm emits, which puts ESC bytes
+    // Uses the ST terminator the backend emits, which puts ESC bytes
     // at the start and in the middle of the payload.
     const OSC52_WITH_ST: &str = "\u{1b}]52;c;SGVsbG8=\u{1b}\\";
 
@@ -668,11 +761,8 @@ mod tests {
     }
 
     #[test]
-    fn tmux_wrap_roundtrips_crossterm_osc52_output() {
-        let mut sequence = String::new();
-        CopyToClipboard::to_clipboard_from("hello, world!")
-            .write_ansi(&mut sequence)
-            .expect("crossterm write_ansi");
+    fn tmux_wrap_roundtrips_osc52_output() {
+        let sequence = clipboard_osc("hello, world!");
         let wrapped = TerminalMux::Tmux.wrap_for_mux(sequence.clone());
         assert_eq!(parse_dcs_passthrough(&wrapped, "\u{1b}Ptmux;"), sequence);
     }

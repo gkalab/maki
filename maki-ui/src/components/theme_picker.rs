@@ -3,9 +3,9 @@ use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::repaint::Cadence;
 use crate::theme;
 
-use crossterm::event::KeyEvent;
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use termina::event::KeyEvent;
 
 const TITLE: &str = " Themes ";
 const MAX_VISIBLE: u16 = 15;
@@ -117,7 +117,7 @@ mod tests {
     use super::*;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
-    use crossterm::event::KeyCode;
+    use termina::event::KeyCode;
     use test_case::test_case;
 
     #[test]
@@ -129,9 +129,9 @@ mod tests {
         assert!(!p.is_open());
     }
 
-    #[test_case(key(KeyCode::Esc) ; "escape_restores_and_closes")]
+    #[test_case(key(KeyCode::Escape) ; "escape_restores_and_closes")]
     #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_restores_and_closes")]
-    fn cancel_restores(cancel_key: crossterm::event::KeyEvent) {
+    fn cancel_restores(cancel_key: termina::event::KeyEvent) {
         let mut p = ThemePicker::new();
         p.open();
         p.handle_key(key(KeyCode::Down));

@@ -1283,10 +1283,10 @@ mod tests {
     use super::*;
     use crate::api::keymap::TAKEN_ERR;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
-    use crossterm::event::KeyCode;
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use maki_agent::tools::ToolRegistry;
     use std::time::Instant;
+    use termina::event::KeyCode;
     use test_case::test_case;
 
     const GLOBAL_TRUST_PATH: &str = "~/src/me/*";

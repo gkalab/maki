@@ -6,11 +6,11 @@ use crate::components::streaming_content::StreamingContent;
 use crate::components::tool_display::{assistant_style, thinking_indicator, thinking_style};
 use crate::theme;
 
-use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use termina::event::{KeyCode, KeyEvent};
 
 use crate::repaint::{Cadence, Dirty};
 
@@ -129,7 +129,7 @@ impl BtwModal {
 
     pub fn handle_key(&mut self, key_event: KeyEvent) {
         match key_event.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => {
+            KeyCode::Escape | KeyCode::Enter | KeyCode::Char(' ') => {
                 self.close();
             }
             _ => {
@@ -245,8 +245,8 @@ impl Overlay for BtwModal {
 mod tests {
     use super::*;
     use crate::components::key as key_ev;
-    use crossterm::event::KeyCode;
     use ratatui::style::Style;
+    use termina::event::KeyCode;
     use test_case::test_case;
 
     const INSTANT: u64 = 0;
@@ -349,7 +349,7 @@ mod tests {
         assert!(!m.is_streaming());
     }
 
-    #[test_case(KeyCode::Esc   ; "esc_closes")]
+    #[test_case(KeyCode::Escape   ; "esc_closes")]
     #[test_case(KeyCode::Enter ; "enter_closes")]
     #[test_case(KeyCode::Char(' ') ; "space_closes")]
     fn dismiss_keys_close(code: KeyCode) {

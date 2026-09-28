@@ -1,9 +1,9 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_lua::PackPlan;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
+use termina::event::{KeyCode, KeyEvent, Modifiers};
 
 use crate::components::Overlay;
 use crate::components::form::render_form;
@@ -57,7 +57,7 @@ impl PackReview {
         }
         if key
             .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            .intersects(Modifiers::CONTROL | Modifiers::ALT)
         {
             return None;
         }
@@ -66,7 +66,7 @@ impl PackReview {
                 Self::Open { plan, .. } => Some(PackReviewAction::Accept(plan)),
                 Self::Closed => None,
             },
-            KeyCode::Char('n') | KeyCode::Esc => {
+            KeyCode::Char('n') | KeyCode::Escape => {
                 self.close();
                 Some(PackReviewAction::Decline)
             }

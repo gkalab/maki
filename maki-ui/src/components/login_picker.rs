@@ -1,9 +1,9 @@
-use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
+use termina::event::{KeyCode, KeyEvent};
 
 use maki_config::providers::{self, Protocol, ProviderDef, ProvidersConfig, slugify};
 use maki_providers::catalog_providers_if_available;
@@ -348,7 +348,7 @@ impl LoginPicker {
                     }
                     StepAction::GoCustomProtocol { slug }
                 }
-                KeyCode::Esc => StepAction::Back,
+                KeyCode::Escape => StepAction::Back,
                 _ => {
                     input.handle_key(key);
                     return LoginPickerAction::Consumed;
@@ -386,7 +386,7 @@ impl LoginPicker {
                         api_key_optional: false,
                     }
                 }
-                KeyCode::Esc => StepAction::Back,
+                KeyCode::Escape => StepAction::Back,
                 _ => {
                     input.handle_key(key);
                     return LoginPickerAction::Consumed;
@@ -508,7 +508,7 @@ impl LoginPicker {
                         slug: slug_c.clone(),
                     }
                 }
-                KeyCode::Esc => StepAction::Back,
+                KeyCode::Escape => StepAction::Back,
                 _ => {
                     input.handle_key(key);
                     return LoginPickerAction::Consumed;
@@ -533,14 +533,14 @@ impl LoginPicker {
                         api_key_optional: true,
                     }
                 }
-                KeyCode::Esc => StepAction::Back,
+                KeyCode::Escape => StepAction::Back,
                 _ => {
                     input.handle_key(key);
                     return LoginPickerAction::Consumed;
                 }
             },
             Step::Done { .. } => {
-                if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Escape) {
                     StepAction::Close
                 } else {
                     StepAction::None

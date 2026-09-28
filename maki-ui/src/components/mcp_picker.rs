@@ -1,6 +1,6 @@
-use crossterm::event::KeyEvent;
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use termina::event::KeyEvent;
 
 use maki_agent::{McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader};
 
@@ -167,9 +167,9 @@ mod tests {
     use super::*;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
-    use crossterm::event::{KeyCode, KeyEvent};
     use maki_agent::{McpServerInfo, McpSnapshot};
     use std::path::PathBuf;
+    use termina::event::{KeyCode, KeyEvent};
     use test_case::test_case;
 
     fn test_snapshot() -> McpSnapshotReader {
@@ -213,7 +213,7 @@ mod tests {
         ));
     }
 
-    #[test_case(key(KeyCode::Esc)       ; "esc_closes")]
+    #[test_case(key(KeyCode::Escape)       ; "esc_closes")]
     #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_closes")]
     fn close_keys(cancel_key: KeyEvent) {
         let mut p = McpPicker::new(test_snapshot(), McpConfigErrors::new(PathBuf::new()));

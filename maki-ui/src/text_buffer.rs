@@ -1,15 +1,15 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use termina::event::{KeyCode, KeyEvent, Modifiers};
 
 use crate::highlight::TAB_SPACES;
 
 pub fn is_newline_key(key: &KeyEvent) -> bool {
     (matches!(key.code, KeyCode::Enter)
         && key.modifiers.intersects(
-            KeyModifiers::SHIFT
-                .union(KeyModifiers::CONTROL)
-                .union(KeyModifiers::ALT),
+            Modifiers::SHIFT
+                .union(Modifiers::CONTROL)
+                .union(Modifiers::ALT),
         ))
-        || (key.code == KeyCode::Char('j') && key.modifiers == KeyModifiers::CONTROL)
+        || (key.code == KeyCode::Char('j') && key.modifiers == Modifiers::CONTROL)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,9 +434,9 @@ impl TextBuffer {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> EditResult {
         let m = key.modifiers;
-        let ctrl = m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT);
-        let alt = m.contains(KeyModifiers::ALT) && !m.contains(KeyModifiers::CONTROL);
-        let sup = m.contains(KeyModifiers::SUPER);
+        let ctrl = m.contains(Modifiers::CONTROL) && !m.contains(Modifiers::ALT);
+        let alt = m.contains(Modifiers::ALT) && !m.contains(Modifiers::CONTROL);
+        let sup = m.contains(Modifiers::SUPER);
 
         if ctrl {
             return match key.code {
@@ -557,10 +557,10 @@ impl TextBuffer {
 #[cfg(test)]
 mod tests {
     use super::{EditResult, TAB_SPACES, TextBuffer};
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use termina::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, Modifiers};
     use test_case::test_case;
 
-    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+    fn key(code: KeyCode, modifiers: Modifiers) -> KeyEvent {
         KeyEvent {
             code,
             modifiers,
@@ -806,24 +806,24 @@ mod tests {
     }
 
     fn plain(code: KeyCode) -> KeyEvent {
-        key(code, KeyModifiers::NONE)
+        key(code, Modifiers::NONE)
     }
 
     fn ctrl(code: KeyCode) -> KeyEvent {
-        key(code, KeyModifiers::CONTROL)
+        key(code, Modifiers::CONTROL)
     }
 
     fn alt(code: KeyCode) -> KeyEvent {
-        key(code, KeyModifiers::ALT)
+        key(code, Modifiers::ALT)
     }
 
     fn super_key(code: KeyCode) -> KeyEvent {
-        key(code, KeyModifiers::SUPER)
+        key(code, Modifiers::SUPER)
     }
 
     #[test_case(plain(KeyCode::Char('a')),      EditResult::Changed ; "plain_changed")]
     #[test_case(plain(KeyCode::Left),            EditResult::Moved   ; "plain_moved")]
-    #[test_case(plain(KeyCode::F(1)),            EditResult::Ignored ; "plain_ignored")]
+    #[test_case(plain(KeyCode::Function(1)),            EditResult::Ignored ; "plain_ignored")]
     #[test_case(ctrl(KeyCode::Char('e')),        EditResult::Moved   ; "ctrl_e_moved")]
     #[test_case(ctrl(KeyCode::Char('k')),        EditResult::Changed ; "ctrl_changed")]
     #[test_case(ctrl(KeyCode::Char('a')),        EditResult::Moved   ; "ctrl_moved")]

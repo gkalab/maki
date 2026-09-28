@@ -3,12 +3,12 @@ use crate::components::hint_line;
 use crate::components::keybindings::key;
 use crate::theme;
 
-use crossterm::event::{KeyCode, KeyEvent};
 use maki_lua::{PlanFormRow, PlanMenu, PlanRowAction};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use termina::event::{KeyCode, KeyEvent};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const FORM_LABEL: &str = " Plan complete ";
@@ -241,7 +241,7 @@ impl PlanForm {
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> PlanFormAction {
         if key::QUIT.matches(key_event)
-            || key_event.code == KeyCode::Esc
+            || key_event.code == KeyCode::Escape
             || key::PLAN_TOGGLE.matches(key_event)
         {
             return PlanFormAction::Hide;
@@ -538,7 +538,7 @@ mod tests {
         assert_eq!(form.parallel(), initial);
     }
 
-    #[test_case(key(KeyCode::Esc)              ; "esc")]
+    #[test_case(key(KeyCode::Escape)              ; "esc")]
     #[test_case(key::QUIT.to_key_event()      ; "ctrl_c")]
     #[test_case(key::PLAN_TOGGLE.to_key_event(); "ctrl_t")]
     fn dismiss(k: KeyEvent) {

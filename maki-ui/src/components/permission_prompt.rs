@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use termina::event::{KeyCode, KeyEvent, Modifiers};
 
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
 use maki_config::ToolKey;
@@ -251,7 +251,7 @@ impl PermissionPrompt {
                         Some(PermissionAnswer::DenyWithGuidance(text))
                     }
                 }
-                KeyCode::Esc => {
+                KeyCode::Escape => {
                     *buffer = TextBuffer::new(String::new());
                     *state = PromptState::Normal;
                     None
@@ -264,7 +264,7 @@ impl PermissionPrompt {
         }
         if key
             .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            .intersects(Modifiers::CONTROL | Modifiers::ALT)
         {
             return None;
         }
@@ -478,9 +478,9 @@ impl PermissionPrompt {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_agent::permissions::PermissionAnswer;
     use maki_config::ToolKey;
+    use termina::event::{KeyCode, KeyEvent, Modifiers};
     use test_case::test_case;
 
     use super::{
@@ -536,11 +536,11 @@ mod tests {
     }
 
     fn ctrl_c() -> KeyEvent {
-        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        KeyEvent::new(KeyCode::Char('c'), Modifiers::CONTROL)
     }
 
     fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
+        KeyEvent::new(code, Modifiers::NONE)
     }
 
     #[test]
@@ -566,7 +566,7 @@ mod tests {
         let mut prompt = open_prompt();
         prompt.handle_key(key(KeyCode::Char('n')));
         prompt.handle_key(key(KeyCode::Char('t')));
-        assert_eq!(answer(&mut prompt, key(KeyCode::Esc)), None);
+        assert_eq!(answer(&mut prompt, key(KeyCode::Escape)), None);
         assert_eq!(prompt.state, PromptState::Normal);
         assert!(prompt.buffer.value().is_empty());
     }

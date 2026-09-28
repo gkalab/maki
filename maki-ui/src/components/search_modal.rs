@@ -7,7 +7,6 @@ use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
-use crossterm::event::{KeyCode, KeyEvent};
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::Frame;
@@ -15,6 +14,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use termina::event::{KeyCode, KeyEvent};
 
 const MODAL_TITLE: &str = " Search ";
 const MODAL_WIDTH_PERCENT: u16 = 50;
@@ -92,7 +92,7 @@ impl SearchModal {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SearchAction {
         match key.code {
-            KeyCode::Esc => SearchAction::Close(self.saved_scroll.take()),
+            KeyCode::Escape => SearchAction::Close(self.saved_scroll.take()),
             KeyCode::Enter => {
                 if let Some(m) = self.matches.get(self.selected) {
                     SearchAction::Select(m.segment_index)
@@ -354,13 +354,13 @@ fn build_highlighted_line<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+    use termina::event::{KeyEventKind, KeyEventState, Modifiers};
     use test_case::test_case;
 
     fn key_event(code: KeyCode) -> KeyEvent {
         KeyEvent {
             code,
-            modifiers: KeyModifiers::NONE,
+            modifiers: Modifiers::NONE,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }

@@ -4,13 +4,15 @@
 //! normalize. Parsing and printing read the same tables, so
 //! `Key::parse(k.notation()) == Ok(k)` holds for every `Key`.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::hash::{Hash, Hasher};
+
+use termina::event::{KeyCode, KeyEvent, Modifiers};
 
 /// Canonical names only. Other spellings users may type go in
 /// [`NAME_ALIASES`].
 const NAMED_KEYS: &[(&str, KeyCode)] = &[
     ("CR", KeyCode::Enter),
-    ("Esc", KeyCode::Esc),
+    ("Esc", KeyCode::Escape),
     ("BS", KeyCode::Backspace),
     ("Del", KeyCode::Delete),
     ("Tab", KeyCode::Tab),
@@ -37,24 +39,24 @@ const NAME_ALIASES: &[(&str, &str)] = &[
 ];
 
 /// Canonical prefixes, in the order [`Key::notation`] prints them.
-const MODIFIERS: &[(&str, KeyModifiers)] = &[
-    ("C-", KeyModifiers::CONTROL),
-    ("M-", KeyModifiers::ALT),
-    ("S-", KeyModifiers::SHIFT),
+const MODIFIERS: &[(&str, Modifiers)] = &[
+    ("C-", Modifiers::CONTROL),
+    ("M-", Modifiers::ALT),
+    ("S-", Modifiers::SHIFT),
 ];
 
-const MODIFIER_ALIASES: &[(&str, KeyModifiers)] = &[
-    ("ctrl-", KeyModifiers::CONTROL),
-    ("alt-", KeyModifiers::ALT),
-    ("a-", KeyModifiers::ALT),
-    ("shift-", KeyModifiers::SHIFT),
+const MODIFIER_ALIASES: &[(&str, Modifiers)] = &[
+    ("ctrl-", Modifiers::CONTROL),
+    ("alt-", Modifiers::ALT),
+    ("a-", Modifiers::ALT),
+    ("shift-", Modifiers::SHIFT),
 ];
 
 /// A press carrying `SUPER`, `HYPER` or `META` has no spelling, so it is not a
 /// [`Key`].
-const NAMEABLE_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL
-    .union(KeyModifiers::ALT)
-    .union(KeyModifiers::SHIFT);
+const NAMEABLE_MODIFIERS: Modifiers = Modifiers::CONTROL
+    .union(Modifiers::ALT)
+    .union(Modifiers::SHIFT);
 
 /// Kitty reports past F12, and `<F13>` is valid vim notation.
 const MAX_FUNCTION_KEY: u8 = 24;
@@ -67,11 +69,11 @@ const MAX_FUNCTION_KEY: u8 = 24;
 pub const RESERVED_KEYS: [Key; 2] = [
     Key {
         code: KeyCode::Char('c'),
-        modifiers: KeyModifiers::CONTROL,
+        modifiers: Modifiers::CONTROL,
     },
     Key {
         code: KeyCode::Char('z'),
-        modifiers: KeyModifiers::CONTROL,
+        modifiers: Modifiers::CONTROL,
     },
 ];
 
@@ -97,13 +99,25 @@ pub(crate) fn candidate_spellings() -> Vec<(String, Key)> {
 
 /// A keypress as plugins see it.
 ///
-/// Not a wrapped [`KeyEvent`], because crossterm's equality also compares
+/// Not a wrapped [`KeyEvent`], because termina's equality also compares
 /// `kind` and `state`, and two presses of the same key should be equal
 /// whatever the terminal put there. `Copy` like `KeyEvent` itself.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Key {
     code: KeyCode,
-    modifiers: KeyModifiers,
+    modifiers: Modifiers,
+}
+
+impl Hash for Key {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(&self.code).hash(state);
+        match self.code {
+            KeyCode::Char(c) => c.hash(state),
+            KeyCode::Function(n) => n.hash(state),
+            _ => {}
+        }
+        self.modifiers.bits().hash(state);
+    }
 }
 
 impl Key {
@@ -131,7 +145,7 @@ impl Key {
 
         let mut chars = s.chars();
         match (chars.next(), chars.next()) {
-            (Some(c), None) => Ok(Self::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            (Some(c), None) => Ok(Self::new(KeyCode::Char(c), Modifiers::NONE)),
             _ => Err(format!("invalid key notation: {s}")),
         }
     }
@@ -157,7 +171,7 @@ impl Key {
         self.code
     }
 
-    pub fn modifiers(&self) -> KeyModifiers {
+    pub fn modifiers(&self) -> Modifiers {
         self.modifiers
     }
 
@@ -165,7 +179,7 @@ impl Key {
         RESERVED_KEYS.contains(self)
     }
 
-    fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
+    fn new(code: KeyCode, modifiers: Modifiers) -> Self {
         let (code, modifiers) = normalize(code, modifiers);
         Self { code, modifiers }
     }
@@ -201,23 +215,23 @@ pub fn is_reserved(key: KeyEvent) -> bool {
 ///    sends Shift+1 as `! + SHIFT` and every other terminal as `!`, and
 ///    both are `!`. `<S-Space>` is `<Space>`. With `ALT` it keeps the bit:
 ///    `<M-S-1>`.
-fn normalize(code: KeyCode, mut modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
+fn normalize(code: KeyCode, mut modifiers: Modifiers) -> (KeyCode, Modifiers) {
     let mut code = match code {
-        KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
+        KeyCode::Tab if modifiers.contains(Modifiers::SHIFT) => KeyCode::BackTab,
         other => other,
     };
     if code == KeyCode::BackTab {
-        modifiers |= KeyModifiers::SHIFT;
+        modifiers |= Modifiers::SHIFT;
     }
     if let KeyCode::Char(c) = code {
-        if modifiers.contains(KeyModifiers::CONTROL) {
+        if modifiers.contains(Modifiers::CONTROL) {
             code = KeyCode::Char(single(c.to_lowercase()).unwrap_or(c));
-        } else if modifiers.contains(KeyModifiers::SHIFT) {
+        } else if modifiers.contains(Modifiers::SHIFT) {
             if let Some(upper) = shifted(c) {
                 code = KeyCode::Char(upper);
-                modifiers.remove(KeyModifiers::SHIFT);
-            } else if !modifiers.contains(KeyModifiers::ALT) {
-                modifiers.remove(KeyModifiers::SHIFT);
+                modifiers.remove(Modifiers::SHIFT);
+            } else if !modifiers.contains(Modifiers::ALT) {
+                modifiers.remove(Modifiers::SHIFT);
             }
         }
     }
@@ -251,13 +265,13 @@ fn name_of(code: KeyCode) -> Option<String> {
     }
     match code {
         KeyCode::Char(c) => Some(c.to_string()),
-        KeyCode::F(n @ 1..=MAX_FUNCTION_KEY) => Some(format!("F{n}")),
+        KeyCode::Function(n @ 1..=MAX_FUNCTION_KEY) => Some(format!("F{n}")),
         _ => None,
     }
 }
 
-fn strip_modifiers(inner: &str) -> (KeyModifiers, &str) {
-    let mut modifiers = KeyModifiers::NONE;
+fn strip_modifiers(inner: &str) -> (Modifiers, &str) {
+    let mut modifiers = Modifiers::NONE;
     let mut rest = inner;
     'strip: loop {
         for (prefix, bits) in MODIFIERS.iter().chain(MODIFIER_ALIASES) {
@@ -296,7 +310,7 @@ fn code_of(name: &str) -> Result<KeyCode, String> {
         && let Ok(n) = number.parse::<u8>()
     {
         return match n {
-            1..=MAX_FUNCTION_KEY => Ok(KeyCode::F(n)),
+            1..=MAX_FUNCTION_KEY => Ok(KeyCode::Function(n)),
             _ => Err(format!("function key out of range: {name}")),
         };
     }
@@ -307,15 +321,15 @@ fn code_of(name: &str) -> Result<KeyCode, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{MediaKeyCode, ModifierKeyCode};
+    use termina::event::{MediaKeyCode, ModifierKeyCode};
     use test_case::test_case;
 
-    const CONTROL: KeyModifiers = KeyModifiers::CONTROL;
-    const ALT: KeyModifiers = KeyModifiers::ALT;
-    const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
-    const NONE: KeyModifiers = KeyModifiers::NONE;
+    const CONTROL: Modifiers = Modifiers::CONTROL;
+    const ALT: Modifiers = Modifiers::ALT;
+    const SHIFT: Modifiers = Modifiers::SHIFT;
+    const NONE: Modifiers = Modifiers::NONE;
 
-    fn event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+    fn event(code: KeyCode, modifiers: Modifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
     }
 
@@ -351,7 +365,7 @@ mod tests {
     }
 
     const CHAR_SAMPLE: &[char] = &['a', 'z', 'A', 'Z', '1', '!', 'ä', 'Ä', 'ß'];
-    const MODIFIER_COMBOS: [KeyModifiers; 8] = [
+    const MODIFIER_COMBOS: [Modifiers; 8] = [
         NONE,
         CONTROL,
         ALT,
@@ -362,7 +376,7 @@ mod tests {
         CONTROL.union(ALT).union(SHIFT),
     ];
 
-    fn prefix_of(mods: KeyModifiers) -> String {
+    fn prefix_of(mods: Modifiers) -> String {
         MODIFIERS
             .iter()
             .filter(|(_, bits)| mods.contains(*bits))
@@ -424,9 +438,9 @@ mod tests {
     #[test_case(KeyCode::Char('1'), SHIFT ; "shift_digit")]
     #[test_case(KeyCode::Char('!'), ALT.union(SHIFT) ; "alt_shift_symbol")]
     #[test_case(KeyCode::Char(' '), CONTROL ; "ctrl_space")]
-    #[test_case(KeyCode::F(24), ALT ; "alt_f24")]
+    #[test_case(KeyCode::Function(24), ALT ; "alt_f24")]
     #[test_case(KeyCode::Enter, NONE ; "plain_enter")]
-    fn normalization_is_idempotent_and_notation_round_trips(code: KeyCode, mods: KeyModifiers) {
+    fn normalization_is_idempotent_and_notation_round_trips(code: KeyCode, mods: Modifiers) {
         let (once, once_mods) = normalize(code, mods);
         assert_eq!(
             normalize(once, once_mods),
@@ -448,10 +462,10 @@ mod tests {
     #[test_case(KeyCode::Char('1'), ALT.union(SHIFT), "<M-S-1>" ; "alt_shift_digit_keeps_its_bit")]
     #[test_case(KeyCode::Char('x'), ALT, "<M-x>" ; "alt_is_printed_as_m")]
     #[test_case(KeyCode::Home, ALT, "<M-Home>" ; "alt_home")]
-    #[test_case(KeyCode::F(13), NONE, "<F13>" ; "f13")]
+    #[test_case(KeyCode::Function(13), NONE, "<F13>" ; "f13")]
     #[test_case(KeyCode::Char('a'), NONE, "a" ; "plain_char")]
     #[test_case(KeyCode::Char('n'), CONTROL.union(SHIFT).union(ALT), "<C-M-S-n>" ; "modifier_order")]
-    fn notation_cases(code: KeyCode, mods: KeyModifiers, expected: &str) {
+    fn notation_cases(code: KeyCode, mods: Modifiers, expected: &str) {
         let key = Key::from_event(event(code, mods)).expect("nameable");
         assert_eq!(key.notation(), expected);
     }
@@ -465,7 +479,7 @@ mod tests {
     #[test_case("<S-Space>", KeyCode::Char(' '), NONE ; "shift_space_is_space")]
     #[test_case("<M-S-1>", KeyCode::Char('1'), ALT.union(SHIFT) ; "alt_shift_digit")]
     #[test_case("<", KeyCode::Char('<'), NONE ; "bare_angle_bracket")]
-    fn parse_cases(input: &str, code: KeyCode, mods: KeyModifiers) {
+    fn parse_cases(input: &str, code: KeyCode, mods: Modifiers) {
         let key = Key::parse(input).unwrap();
         assert_eq!(key.code(), code);
         assert_eq!(key.modifiers(), mods);
@@ -485,8 +499,8 @@ mod tests {
     #[test_case(KeyCode::Modifier(ModifierKeyCode::LeftShift), NONE ; "bare_modifier")]
     #[test_case(KeyCode::CapsLock, NONE ; "caps_lock")]
     #[test_case(KeyCode::Null, NONE ; "null")]
-    #[test_case(KeyCode::Char('a'), KeyModifiers::SUPER ; "modifier_notation_cannot_spell")]
-    fn from_event_refuses_what_notation_cannot_name(code: KeyCode, mods: KeyModifiers) {
+    #[test_case(KeyCode::Char('a'), Modifiers::SUPER ; "modifier_notation_cannot_spell")]
+    fn from_event_refuses_what_notation_cannot_name(code: KeyCode, mods: Modifiers) {
         assert_eq!(Key::from_event(event(code, mods)), None);
     }
 

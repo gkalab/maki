@@ -5,13 +5,13 @@ pub mod pkce;
 pub mod registration;
 pub mod token;
 
+use std::path::Path;
 use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_lite::future;
 use isahc::HttpClient;
-use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use maki_storage::StateDir;
 use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
 use tracing::{info, warn};
@@ -23,6 +23,7 @@ use self::discovery::{
 };
 use super::config::OauthClientConfig;
 use super::error::McpError;
+use super::http::build_client;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(600);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -55,13 +56,13 @@ pub async fn authenticate(
     storage: &StateDir,
     interaction: Interaction,
     static_client: Option<OauthClientConfig>,
+    ca_file: Option<&Path>,
 ) -> Result<McpAuthData, McpError> {
     let wrap = |e: OAuthError| McpError::OAuthFailed {
         server: server_name.into(),
         reason: e.to_string(),
     };
-    let client =
-        build_http_client(HTTP_TIMEOUT).map_err(|e| wrap(OAuthError::Other(e.to_string())))?;
+    let client = build_client(HTTP_TIMEOUT, ca_file).map_err(|e| wrap(OAuthError::Other(e)))?;
 
     if let Some(existing) = load_mcp_auth(storage, server_name, server_url)
         && let Some(ref tokens) = existing.tokens
@@ -70,7 +71,7 @@ pub async fn authenticate(
         return Ok(existing);
     }
 
-    match silent_refresh(storage, server_name, server_url).await {
+    match silent_refresh(storage, server_name, server_url, ca_file).await {
         Ok(Some(data)) => return Ok(data),
         Ok(None) => {}
         Err(e) => {
@@ -233,6 +234,7 @@ pub async fn silent_refresh(
     storage: &StateDir,
     server_name: &str,
     server_url: &str,
+    ca_file: Option<&Path>,
 ) -> Result<Option<McpAuthData>, OAuthError> {
     let Some(existing) = load_mcp_auth(storage, server_name, server_url) else {
         return Ok(None);
@@ -246,8 +248,7 @@ pub async fn silent_refresh(
         return Ok(None);
     }
 
-    let client = build_http_client(SILENT_REFRESH_HTTP_TIMEOUT)
-        .map_err(|e| OAuthError::Other(e.to_string()))?;
+    let client = build_client(SILENT_REFRESH_HTTP_TIMEOUT, ca_file).map_err(OAuthError::Other)?;
 
     // Trust the endpoint pinned at interactive auth over fresh discovery: a
     // later-compromised server must not redirect the refresh token (and any
@@ -313,15 +314,6 @@ fn is_headless() -> bool {
     cfg!(target_os = "linux")
         && std::env::var_os("DISPLAY").is_none()
         && std::env::var_os("WAYLAND_DISPLAY").is_none()
-}
-
-fn build_http_client(timeout: Duration) -> Result<HttpClient, isahc::Error> {
-    HttpClient::builder()
-        .redirect_policy(RedirectPolicy::Limit(super::http::MAX_REDIRECTS))
-        // Same pin as mcp::http, so oauth and data traffic match.
-        .version_negotiation(VersionNegotiation::http11())
-        .timeout(timeout)
-        .build()
 }
 
 fn build_authorization_url(

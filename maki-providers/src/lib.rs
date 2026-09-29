@@ -1,3 +1,4 @@
+mod child_env;
 pub(crate) mod error;
 pub(crate) mod image;
 pub(crate) mod manifest;
@@ -8,9 +9,14 @@ pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
 pub mod spec;
+/// One recorded server for two audiences: other crates get it behind the
+/// feature, this crate's own tests get it without.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod tokens;
 pub(crate) mod types;
 
+pub use child_env::strip_provider_keys;
 pub use error::{AgentError, Overflow};
 pub use maki_storage::sessions::add_cost;
 pub use model::{
@@ -18,17 +24,18 @@ pub use model::{
     ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
-pub use providers::Timeouts;
 pub use providers::catalog::ProviderData;
 pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,
     catalog_providers_if_available, refresh_catalog, warm_catalog,
 };
 pub use providers::copilot::auth as copilot_auth;
-pub use providers::dynamic;
+pub use providers::custom;
 pub use providers::openai::auth as openai_auth;
+pub use providers::plugin;
 pub use providers::xai::auth as xai_auth;
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+pub use providers::{Timeouts, user_agent};
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
     ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_EVICTED_NOTE,

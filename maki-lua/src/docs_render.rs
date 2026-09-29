@@ -52,6 +52,10 @@ The rules:
 - A package, or a plugin maki ships, is read the other way round: a key it
   does not name is not requested, so its `plugin.toml` lists everything it
   uses. Only a `plugin.toml` you wrote yourself defaults to granted.
+- `net_hosts` narrows `net = true` to a host allowlist, such as
+  `["api.acme.com", "*.acme.dev"]`. Without it, `net` reaches any public
+  host. A plugin that registers a provider must set it. See
+  [Plugin egress](/docs/permissions/#plugin-egress-net-hosts).
 - `min_maki_version` is optional and takes a plain semantic version as a lower
   bound, so ranges do not work. When the field is invalid or the running
   version is older, Maki skips the Lua in that directory and warns at startup

@@ -48,6 +48,7 @@ Write content to a file, replacing existing content.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `append` | boolean | no | Add content to the end of the file instead of replacing it |
 | `content` | string | yes | The complete file content to write |
 | `path` | string | yes | Absolute path to the file |
 

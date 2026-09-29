@@ -33,10 +33,10 @@ use serde_json::Value;
 use strum::{EnumString, IntoStaticStr};
 
 use maki_config::RawConfig;
+use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
 
 use crate::api::autocmd::AutocmdStore;
-use crate::api::create_maki_global;
 use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
@@ -63,6 +63,7 @@ use crate::api::util::command::{
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::setup::ConfigStore;
+use crate::api::{Owner, create_maki_global};
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::key_lint::KeyLint;
@@ -155,6 +156,7 @@ const PLAN_FORM_AUTHORITY: Authority = Authority::Unbounded;
 pub const PLAN_ROW_HANDLER_DEADLINE: Duration = Duration::from_secs(30);
 const PLAN_HANDLERS_MISSING_ERR: &str = "plan row handlers not initialized";
 const PLAN_HANDLER_GONE_ERR: &str = "plan row handler was reaped";
+const NO_PLUGIN_HOST: &str = "no plugin host is running this code";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
 pub(crate) const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
@@ -230,8 +232,9 @@ fn load_user_source<'a>(lua: &'a Lua, name: &str, source: &'a str) -> Chunk<'a> 
 /// Everything a load needs besides the code itself.
 ///
 /// One value rather than a row of positional arguments: it travels unchanged
-/// from the caller through the request channel into the runtime, and the two
-/// package-only fields would otherwise be `None, false` at every other site.
+/// from the caller through the request channel into the runtime, and the
+/// fields only a package cares about would otherwise be spelled out, at their
+/// boring default, by every other caller.
 pub struct LoadContext {
     pub plugin_dir: Option<PathBuf>,
     pub permissions: PluginPermissions,
@@ -243,6 +246,12 @@ pub struct LoadContext {
     /// Whether this owner is a package, which is what `pack.get` reports as
     /// active.
     pub package: bool,
+    /// Whether the code being loaded ships inside the binary, which is what
+    /// lets it declare a provider under a built-in slug. Everything else is
+    /// third party however the user installed it, so every path but
+    /// [`PluginHost::load_builtins`] leaves this at the answer that grants
+    /// nothing.
+    pub authority: DeclAuthority,
 }
 
 impl LoadContext {
@@ -255,6 +264,7 @@ impl LoadContext {
             opts: PluginOpts::default(),
             revision_guard: None,
             package: false,
+            authority: DeclAuthority::ThirdParty,
         }
     }
 }
@@ -332,6 +342,25 @@ pub enum Request {
         chunks: Vec<LoadChunk>,
         context: LoadContext,
         reply: flume::Sender<LoadResult>,
+    },
+    /// One call into a hook a plugin registered with `maki.provider`.
+    ///
+    /// Carries the hook handles themselves rather than a plugin name: the call
+    /// runs against the functions it started with, so an unload mid-flight
+    /// cannot swap the code out from under it. Rides the priority lane and is
+    /// spawned like a tool call, but takes no [`InflightGate`] slot: a provider
+    /// hook is not a tool, and the model is waiting on it.
+    ///
+    /// Ends like a tool call does, though: at `deadline`, or once `cancel`
+    /// fires because the caller stopped waiting. A hook nobody waits for must
+    /// not keep spending a refresh token behind the caller's back.
+    CallProviderHook {
+        hook: Arc<crate::api::provider::LuaHookKeys>,
+        slot: crate::api::provider::HookSlot,
+        payload: Value,
+        cancel: CancelToken,
+        deadline: Option<Instant>,
+        answer: crate::api::provider::HookAnswer,
     },
     CallTool {
         plugin: Arc<str>,
@@ -1235,6 +1264,25 @@ pub(crate) async fn run_detached<F: Future>(lua: &Lua, fut: F) -> F::Output {
     run_scoped(lua, TaskScope::detached(lua), fut).await
 }
 
+/// The priority lane, reachable from off the Lua thread.
+///
+/// Provider hooks are called from the async side of the process, so the way
+/// back in has to be something the Lua code that registers them can pick up
+/// while it runs.
+pub(crate) struct ProviderRequests(flume::Sender<Request>);
+
+/// The two ways back to the Lua thread that a provider hook handle keeps: one
+/// to ask for a call, one to hand its registry keys back when it dies. Taken
+/// together because a handle without both is of no use.
+pub(crate) fn host_senders(
+    lua: &Lua,
+) -> mlua::Result<(flume::Sender<Request>, flume::Sender<DeferredCallback>)> {
+    let no_host = || mlua::Error::runtime(NO_PLUGIN_HOST);
+    let requests = lua.app_data_ref::<ProviderRequests>().ok_or_else(no_host)?;
+    let release = lua.app_data_ref::<DeferQueue>().ok_or_else(no_host)?;
+    Ok((requests.0.clone(), release.tx.clone()))
+}
+
 /// [`run_detached`] for plugin code a host caller is blocked on, carrying every
 /// obligation that waiting creates:
 ///
@@ -1257,13 +1305,24 @@ async fn run_awaited<F: Future>(
     deadline: Instant,
     fut: F,
 ) -> Result<F::Output, &'static str> {
-    let scope = TaskScope::new(lua, TaskCell::new(cancel, Some(deadline), None));
-    let handle = Arc::clone(scope.handle());
     covered(
         Some(GateGuard::new(gate)),
-        until_abandoned(run_scoped(lua, scope, fut), &handle),
+        run_abandonable(lua, cancel, Some(deadline), fut),
     )
     .await
+}
+
+/// [`run_awaited`] without the [`InflightGate`] slot, for code a reload must
+/// not wait on, yet that still ends with its caller's cancel and deadline.
+async fn run_abandonable<F: Future>(
+    lua: &Lua,
+    cancel: CancelToken,
+    deadline: Option<Instant>,
+    fut: F,
+) -> Result<F::Output, &'static str> {
+    let scope = TaskScope::new(lua, TaskCell::new(cancel, deadline, None));
+    let handle = Arc::clone(scope.handle());
+    until_abandoned(run_scoped(lua, scope, fut), &handle).await
 }
 
 /// [`run_detached`] for a slash-command handler, seeding the hop count that
@@ -2531,6 +2590,7 @@ impl LuaRuntime {
             opts,
             revision_guard,
             package,
+            authority,
         } = context;
         let map_err = |e: mlua::Error| PluginError::Lua {
             plugin: name.to_string(),
@@ -2557,7 +2617,10 @@ impl LuaRuntime {
             &self.lua,
             Arc::clone(&self.pending),
             Arc::clone(&pending_rules),
-            Arc::clone(&name),
+            Owner {
+                name: Arc::clone(&name),
+                authority,
+            },
             self.ui_action_tx.clone(),
             &permissions,
             Arc::clone(&opts),
@@ -2713,8 +2776,8 @@ impl LuaRuntime {
     }
 
     /// Undoes a load that failed after its chunks ran: the tools it was about
-    /// to register, the package operations it queued, and the commands,
-    /// keymaps, hints and slots it published on the way.
+    /// to register, the package operations it queued, the providers it staged,
+    /// and the commands, keymaps, hints and slots it published on the way.
     fn rollback_load(&mut self, plugin: &str, pending: Vec<PendingTool>, pack_ops: usize) {
         self.discard_pending(pending);
         with_packs(&self.lua, |packs| packs.pending.truncate(pack_ops));
@@ -2723,6 +2786,7 @@ impl LuaRuntime {
 
     fn clear_plugin(&mut self, plugin: &str) {
         self.registry.clear_plugin(plugin);
+        maki_providers::plugin::discard(plugin);
         self.plugin_rules.remove(plugin);
         if let Some(queue) = self.lua.app_data_ref::<DeferQueue>() {
             queue.cancel_plugin(plugin);
@@ -3751,6 +3815,7 @@ pub fn spawn(
 ) -> Result<LuaThread, PluginError> {
     let (tx, rx) = flume::unbounded::<Request>();
     let (prio_tx, prio_rx) = flume::unbounded::<Request>();
+    let prio_tx_thread = prio_tx.clone();
     let tx_clone = tx.clone();
     let layered: Arc<LayeredTools> = Arc::default();
     let layered_thread = Arc::clone(&layered);
@@ -3798,6 +3863,8 @@ pub fn spawn(
                     return;
                 }
             };
+
+            rt.lua.set_app_data(ProviderRequests(prio_tx_thread));
 
             let ex = Rc::new(smol::LocalExecutor::new());
             {
@@ -3933,6 +4000,28 @@ pub fn spawn(
                                 )
                                 .await;
                             let _ = reply.send(res);
+                        }
+                        Request::CallProviderHook {
+                            hook,
+                            slot,
+                            payload,
+                            cancel,
+                            deadline,
+                            answer,
+                        } => {
+                            let lua = rt.lua.clone();
+                            ex.spawn(async move {
+                                let returned = run_abandonable(
+                                    &lua,
+                                    cancel,
+                                    deadline,
+                                    crate::api::provider::run_hook(&lua, &hook, slot, payload),
+                                )
+                                .await
+                                .unwrap_or_else(|why| Err(why.to_owned()));
+                                answer(&lua, returned);
+                            })
+                            .detach();
                         }
                         Request::CallTool {
                             plugin,

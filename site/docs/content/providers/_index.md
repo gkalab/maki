@@ -25,7 +25,14 @@ Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BAS
 ANTHROPIC_BASE_URL=https://my-proxy.internal maki
 ```
 
-It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Two exceptions: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend; `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
+Built-in, plugin and `providers.toml` providers all read it. When several origins are set, the first one wins:
+
+1. An origin the provider's auth hook returns, such as the endpoint a login flow was given.
+2. `<SLUG>_BASE_URL`.
+3. `base_url` in `providers.toml`.
+4. The provider's own default `base_url`.
+
+`ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Two exceptions: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend; `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
 
 You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
 
@@ -413,7 +420,7 @@ supports_vision = false
 | `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
 | `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
 | `headers` | table | Extra HTTP headers sent on every request to this provider. Values expand `${VAR}` from the environment; an unset or empty variable fails the provider instead of sending a half-filled header. A same-name header (case-insensitive) replaces the built-in auth header and survives key rotation |
-| `default_model` | string | Used after login when no model is saved yet |
+| `default_model` | string | Used after login when no model is saved yet. On a custom entry it is also the startup fallback when no built-in or plugin provider is available. Without it, startup picks a declared `strong` or `medium` model |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `subsidised_by` | string | Name of the flat subscription prepaying this provider (e.g. `"Max"`). Models bill $0 and show the published list price beside it as a reference. The list-price fallback needs `protocol = "anthropic"` |
@@ -501,65 +508,277 @@ Current plans:
 
 Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file.
 
-## Dynamic Providers
+## Plugin Providers
 
-To add a custom provider or proxy, drop an executable script into the config `providers/` directory (`~/.config/maki/providers/` on Linux/macOS, `%APPDATA%\maki\providers\` on Windows). The script must handle these subcommands:
+A [Lua plugin](/docs/plugins/) can add a provider. Call `maki.provider.register` at the top level of the plugin file, and its models become `{slug}/{model_id}` (e.g. `acme/acme-large`) in `/model` and the picker. They get the same retries, pricing and usage accounting as a built-in provider.
 
-| Subcommand | Timeout | What it does |
-|------------|---------|--------|
-| `info` | 5s | Return JSON with `display_name`, `base` provider, `has_auth` |
-| `models` | 5s | Return JSON array of model entries (optional) |
-| `resolve` | 30s | Return auth JSON (`base_url`, `headers`) |
-| `login` | interactive | OAuth or credential flow |
-| `logout` | interactive | Clear credentials |
-| `refresh` | 30s | Refresh auth tokens |
-
-`resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
-
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo`, `tensorx`, `opencode`, `xai`, `aperture`.
-
-If your provider serves models not in the base catalog, add a `models` subcommand returning:
-
-```json
-[{"id": "my-model-v2", "tier": "strong", "context_window": 200000, "max_output_tokens": 16384}]
+```lua
+maki.provider.register({
+  slug = "acme",
+  display_name = "Acme",
+  codec = "openai",
+  base_url = "https://api.acme.com/v1",
+  api_key_env = "ACME_API_KEY",
+  models = {
+    { prefixes = { "acme-large" }, tier = "strong", context_window = 200000 },
+  },
+})
 ```
 
-Only `id` is required. Optional fields: `tier` (default `medium`), `context_window` (128K), `max_output_tokens` (16K), `pricing` (`{input, output, cache_write, cache_read}`, all per 1M tokens), `supports_tool_examples` (defaults to the base provider's setting), `supports_thinking` (defaults to the base provider's setting), `requires_thinking` (default false; for APIs that reject requests with thinking off, raises it to minimal effort and implies `supports_thinking`), `supports_vision` (defaults to the base provider's setting; when false, image input and the `view_image` tool are disabled). The first model listed per tier is used for sub-agents. Without this subcommand, the base provider's models are used.
+The plugin's `plugin.toml` must grant `net` and list the provider's hosts in `net_hosts`. `api_key_env` also needs `env`:
 
-A `llama-cpp`, `ollama`, or `openai` base model can replace Maki's token-budget mapping with its native thinking fields. Each thinking mode maps to a JSON fragment merged into the request body:
-
-```json
-[{
-  "id": "reasoning-model",
-  "supports_thinking": true,
-  "thinking_fields": {
-    "off": {"reasoning_effort": "none"},
-    "adaptive": {"reasoning_effort": "medium"},
-    "low": {"reasoning_effort": "low"},
-    "medium": {"reasoning_effort": "medium"},
-    "xhigh": {"reasoning_effort": "xhigh"}
-  }
-}]
+```toml
+[permissions]
+net = true
+env = true
+net_hosts = ["api.acme.com"]
 ```
 
-`off` is used when thinking is off, `adaptive` when thinking is on without a chosen level. Any other key is an effort level, one of `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The levels you declare are the ones the model accepts: whatever you ask for snaps into them, downwards first, so a level the model never advertised is never sent. Every part is optional, but `off` and `adaptive` never snap: a mode you left undeclared sends nothing on the generic `openai` path, and falls back to the base provider's mapping on `llama-cpp` and `ollama`.
+Maki sends the provider's credentials only to those hosts, plus any origin you set yourself with `<SLUG>_BASE_URL` or `providers.toml`. The `base_url` must be `https`, or `http` on loopback. See [plugin egress](/docs/permissions/#plugin-egress-net-hosts) for the pattern syntax.
 
-Fragments are merged into the body, so nesting works too. A template toggle is just a fragment:
+The [Lua API](/docs/lua-api/#maki-provider-register) lists every field. This section explains the choices.
 
-```json
-"thinking_fields": {
-  "off": {"chat_template_kwargs": {"enable_thinking": false}},
-  "adaptive": {"chat_template_kwargs": {"enable_thinking": true}}
-}
+### codec or base
+
+Set exactly one of the two. `codec` picks the wire format the API speaks:
+
+| `codec` | Wire format |
+|---------|-------------|
+| `openai` | OpenAI chat completions |
+| `openai-responses` | OpenAI responses API |
+| `anthropic` | Anthropic messages |
+| `google` | Gemini `generateContent` |
+
+`base` borrows a built-in provider's whole adapter, quirks included, such as Ollama's thinking field or Copilot's endpoint routing. Use it when porting a provider script that set `base`, or when no codec fits. A base changes whenever that provider does, so prefer a codec. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `zai`, `opencode`, `xai`, `aperture`.
+
+Without a `models` table, the provider uses the catalog of its codec or base.
+
+### Model rows
+
+`models` is read once at registration. For a catalog known only at runtime, use the `list_models` hook.
+
+A row matches every model id that starts with one of its `prefixes`, and the longest match wins: `acme-large-2504` uses an `acme-large` row over an `acme` row. `prefixes[1]` is the canonical id, shown in the picker and used in `{slug}/{model_id}`.
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `prefixes` | list of strings | required | The first is the canonical id |
+| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
+| `context_window` | number | 128000 | Tokens of context |
+| `max_output_tokens` | number | 16384 | Max completion tokens |
+| `supports_thinking` | bool | unset | |
+| `requires_thinking` | bool | `false` | For APIs that reject a request with thinking off. Implies `supports_thinking` and raises thinking to minimal effort when off |
+| `supports_vision` | bool | unset | When false, image input and `view_image` are off for this model |
+| `supports_tool_examples` | bool | unset | |
+| `pricing` | table | unset | `input`, `output`, `cache_write`, `cache_read`, in dollars per 1M tokens |
+| `thinking_fields` | table | unset | How this model spells each thinking mode on the wire |
+
+An unset `supports_*` flag uses the codec or base provider's answer, and `false` turns the feature off for that model.
+
+`thinking_fields` works as in [providers.toml](#providers-toml). Keys are `off`, `adaptive` and the effort levels `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, each mapped to a JSON fragment merged into the request body. A mode you leave out sends nothing with a codec, and falls back to the built-in mapping with `base = "llama-cpp"` or `base = "ollama"`.
+
+### Hooks
+
+Every hook is optional. Without any, the provider reads its key from `api_key_env`.
+
+| Hook | Runs |
+|------|------|
+| `auth(ctx, purpose)` | `"resolve"` before the first request, `"refresh"` after a 401 (then retries once), `"reload"` after a login changed the stored credentials |
+| `list_models(ctx)` | When the picker or `maki models` lists models |
+| `build_body(ctx, body, model, opts)` | On every request, with the final body |
+| `map_error(ctx, status, message)` | On an API error, before it reaches the UI |
+| `fetch_usage(ctx)` | When the usage display asks for quota |
+| `login(ctx)` | `maki auth login <slug>` |
+| `logout(ctx)` | `maki auth logout <slug>` |
+
+Each hook gets a [`ctx`](/docs/lua-api/#maki-provider-register) table first, with the slug, the current origin and headers, and a `ctx.get_json` helper. Build URLs from `ctx.base_url` so side calls follow a user who points the slug at a gateway. To fail, return `nil, err` with an error from `ctx.get_json` or `maki.provider.http_error`, and Maki retries as it would for a built-in provider.
+
+Credentials resolve on the first request. A provider with missing or expired credentials stays in the picker and fails when you send a message, like a built-in provider with no API key.
+
+Defining `login` lists the provider in `maki auth login`. Without it, the slug is an API-key provider.
+
+`map_error` can change the status and message of an API error, for example to turn an opaque vendor error into advice. Retries follow the new status, and `retry-after` still comes from the server.
+
+`build_body` needs the `openai` or `openai-responses` codec, and the `google` codec refuses `system_prefix`. Both mistakes fail at registration.
+
+### Credentials
+
+`maki.provider.auth` stores credentials for the plugin's own slugs:
+
+```lua
+maki.provider.auth.set("acme", { access_token = token, expires_at = when })
+local creds = maki.provider.auth.get("acme")
+maki.provider.auth.clear("acme")
 ```
 
-Named modes send only these fields, no token budget. An explicit `/thinking <budget>` snaps into the levels you declared; a model that declares none gets the `adaptive` fragment plus `thinking_budget_tokens`. Any other undeclared effort level falls back to the usual `thinking_budget_tokens` mapping, so no request ever ends up saying nothing. Models without `thinking_fields` keep the base provider's behavior.
+The value is any JSON object. Each slug gets its own file at `~/.local/state/maki/auth/plugins/<slug>.json`, with mode 0600, atomic writes and a lock against other Maki processes. An `auth` hook can call `set` to save a refreshed token.
 
-Dynamic provider models are namespaced as `{slug}/{model_id}` (e.g. `myproxy/claude-sonnet-4-6`).
+### Slug rules
 
-### Script Name Rules
+- Starts with a letter or digit, then only letters, digits, `_` and `-`
+- Not a built-in slug, because the plugin would inherit the API key you set for the built-in. Plugins bundled with Maki are the exception
+- Not a slug from `providers.toml` or another plugin
 
-- Must start with a letter or digit
-- Only letters, digits, underscores, and hyphens after that
-- Can't reuse a built-in provider's slug
-- Must be executable
+### Migrating from provider scripts
+
+Maki no longer runs executable scripts from the config `providers/` directory. At startup it names every script that no plugin has replaced yet. To port them, run:
+
+```bash
+maki migrate providers
+```
+
+It lists those scripts and prints a prompt that asks a coding agent to port them to Lua plugins. The prompt names your files and directories, maps each part of the script protocol to the Lua API, and ends with checks the agent runs before it reports back. It goes to stdout, so you can start maki with it or copy it into another agent:
+
+```bash
+maki "$(maki migrate providers)"
+maki migrate providers | pbcopy
+```
+
+Each plugin keeps its script's file name as the slug, so saved models and `maki auth login <slug>` keep working. The warning for a script stops once a plugin registers its slug. The prompt tells the agent to leave the scripts and their credential files in place, and to tell you which ones you can delete once every check passes.
+
+To port a script by hand, map each subcommand to part of the registration:
+
+| Script subcommand | Lua |
+|-------------------|-----|
+| `info` | The same fields on the registration table, minus `has_auth`. Defining `login` replaces it |
+| `models` | The `models` table. `id = "acme"` becomes `prefixes = { "acme" }` and matches the same ids |
+| `resolve`, `refresh`, `reload` | `auth = function(ctx, purpose)`, with `purpose` naming the subcommand |
+| `login` | `login = function(ctx)`, using `ctx.print`, `ctx.prompt` and `ctx.open_url` |
+| `logout` | `logout = function(ctx)` |
+
+A script whose `base` was `mistral`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo` or `tensorx` uses `codec = "openai"` now, with that provider's origin as `base_url`. Those providers are Lua plugins themselves, so they cannot be a `base`.
+
+A script that kept credentials in its own file can import them on first use, so nobody has to log in again. Call this from a hook, since `maki.provider.auth.set` only works inside one:
+
+```lua
+local function credentials()
+  local stored = maki.provider.auth.get("acme")
+  if stored then
+    return stored
+  end
+  local text = maki.fs.read(maki.fs.normalize("~/.maki/auth/acme.json"))
+  if not text then
+    return nil
+  end
+  local imported = maki.json.decode(text)
+  maki.provider.auth.set("acme", imported)
+  return imported
+end
+```
+
+### Worked example
+
+Maki's tests load this plugin, so it matches the current API. It uses `codec = "openai"` and every hook.
+
+`plugin.toml`:
+
+```toml
+[permissions]
+net = true
+net_hosts = ["api.acme.example"]
+```
+
+`init.lua`:
+
+```lua
+-- An OpenAI-compatible provider that uses every `maki.provider.register` hook
+-- once. The provider docs quote this file as their worked example.
+
+local ANONYMOUS = "anonymous"
+local REFRESH = "refresh"
+local MODELS_PATH = "/models"
+
+local function stored_token(slug)
+  local stored = maki.provider.auth.get(slug)
+  return (stored and stored.token) or ANONYMOUS
+end
+
+local function bearer(token)
+  return { headers = { authorization = "Bearer " .. token } }
+end
+
+maki.provider.register({
+  slug = "acmelua",
+  display_name = "Acme (Lua)",
+  codec = "openai",
+  base_url = "https://api.acme.example/v1",
+  -- Prepended to maki's system prompt.
+  system_prefix = "Acme house rules: answer in full sentences.",
+  models = {
+    {
+      prefixes = { "acme-1", "acme" },
+      tier = "strong",
+      context_window = 200000,
+      max_output_tokens = 8192,
+      supports_thinking = true,
+      -- The only levels Acme accepts. Maki snaps any other level onto them.
+      thinking_fields = {
+        low = { reasoning_effort = "low" },
+        high = { reasoning_effort = "high" },
+      },
+    },
+  },
+
+  -- `purpose` is "resolve" before the first request, "reload" after a login
+  -- in another process changed the store, and "refresh" after a 401. An Acme
+  -- token is single use, so a refresh mints and stores the next one here.
+  auth = function(ctx, purpose)
+    if purpose ~= REFRESH then
+      return bearer(stored_token(ctx.slug))
+    end
+    local renewed = stored_token(ctx.slug) .. "-renewed"
+    maki.provider.auth.set(ctx.slug, { token = renewed })
+    return bearer(renewed)
+  end,
+
+  -- The catalogue changes faster than this file, so the picker asks the API.
+  -- `ctx.get_json` uses the chat requests' origin and headers.
+  list_models = function(ctx)
+    local body, err = ctx.get_json(MODELS_PATH)
+    if err then
+      return nil, err
+    end
+    local models = {}
+    for _, m in ipairs(body.data or {}) do
+      table.insert(models, { id = m.id, context_window = m.context_length, tier = "strong" })
+    end
+    return models
+  end,
+
+  -- Gets the final body, thinking level included. Acme wants the effort under
+  -- its own key. `opts.thinking` is nil when thinking is off.
+  build_body = function(_, body, model, opts)
+    body.acme_reasoning = { model = model, effort = body.reasoning_effort, asked_for = opts.thinking }
+    body.reasoning_effort = nil
+    return body
+  end,
+
+  -- Acme answers 429 for a spent monthly allowance, which no retry can fix,
+  -- so a 400 stops the retries.
+  map_error = function(_, status, message)
+    if status == 429 and message:find("allowance") then
+      return { status = 400, message = "Acme allowance is spent until the next cycle" }
+    end
+  end,
+
+  fetch_usage = function()
+    return { plan = "team", limits = { { label = "Monthly allowance", percentage = 42 } } }
+  end,
+
+  -- Defining `login` lists the provider in `maki auth login`.
+  login = function(ctx)
+    local key = ctx.prompt({ label = "Acme API key: ", secret = true })
+    if not key or key == "" then
+      ctx.print("No key entered, nothing was stored.")
+      return
+    end
+    maki.provider.auth.set(ctx.slug, { token = key })
+    ctx.print("Stored your Acme key.")
+  end,
+
+  logout = function(ctx)
+    maki.provider.auth.clear(ctx.slug)
+    ctx.print("Forgot your Acme key.")
+  end,
+})
+```
+

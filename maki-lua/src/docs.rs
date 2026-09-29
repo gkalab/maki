@@ -76,6 +76,8 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::log::DOCS,
         &api::model::DOCS,
         &api::net::DOCS,
+        &api::provider::DOCS,
+        &api::provider::AUTH_DOCS,
         &api::session::DOCS,
         &api::top::DOCS,
         &api::top::TIMER_DOCS,
@@ -104,8 +106,9 @@ mod tests {
     use mlua::{Lua, Table, Value};
 
     use super::{DocKind, api_docs};
-    use crate::api::create_maki_global;
+    use crate::api::{Owner, create_maki_global};
     use crate::plugin_permissions::PluginPermissions;
+    use maki_providers::plugin::DeclAuthority;
 
     fn resolve_table(maki: &Table, path: &str) -> Table {
         let mut table = maki.clone();
@@ -143,7 +146,10 @@ mod tests {
             &lua,
             Arc::default(),
             Arc::default(),
-            Arc::from("docs-test"),
+            Owner {
+                name: Arc::from("docs-test"),
+                authority: DeclAuthority::ThirdParty,
+            },
             Some(ui_tx),
             &PluginPermissions::trusted(),
             Arc::default(),

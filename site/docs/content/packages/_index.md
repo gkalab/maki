@@ -158,6 +158,11 @@ every guarded call it makes fails. The
 [permission list](/docs/lua-api/#plugin-permissions) covers what each name
 gates.
 
+Maki stores a package's [`net_hosts`](/docs/permissions/#plugin-egress-net-hosts)
+with its approval. An update that widens the list or drops it asks again before
+it loads. An approval from before Maki stored hosts counts as every host, so
+adding a list to that package never prompts.
+
 An approval applies only to the same package name and source. Maki keeps
 approvals in `<maki-data>/site/pack-approvals.json`, where `<maki-data>` is the
 data directory from the

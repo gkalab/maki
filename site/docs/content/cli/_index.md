@@ -40,7 +40,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 |------|-------------|
 | `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
-| `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
+| `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used (skipped with a warning when its provider is gone or has no key) → `provider.default_model` in config → auto-detect from available providers |
 | `--verbose` | Full turn-by-turn messages in `--print` output |
 | `-c`, `--continue` | Resume the most recent session in this directory |
 | `-r`, `--resume <ID>` | Resume a specific session (aliases: `-s`, `--session`) |
@@ -168,9 +168,12 @@ Debug helper for inspecting the prompt and tool surface the agent sees. `--plan`
 
 ```bash
 maki migrate xdg
+maki migrate providers
 ```
 
-Moves data from `~/.maki/` into platform directories. Safe to re-run. See [Configuration](/docs/configuration/#directory-layout).
+`xdg` moves data from `~/.maki/` into platform directories. Safe to re-run. See [Configuration](/docs/configuration/#directory-layout).
+
+`providers` lists the old provider scripts that no Lua plugin replaces yet, and prints a prompt that asks a coding agent to port them. The prompt goes to stdout, so `maki "$(maki migrate providers)"` starts maki on it. See [Migrating from provider scripts](/docs/providers/#migrating-from-provider-scripts).
 
 ### `maki trust`
 

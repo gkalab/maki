@@ -287,13 +287,16 @@ impl<'h> Agent<'h> {
             .chain([(message, images, preamble)]);
         let mut prompt = None;
         for (message, images, preamble) in burst {
-            let kept = self
+            let kept = match self
                 .filter_user_message(message, images.len(), source)
-                .await?
-                .map(|text| {
+                .await
+            {
+                Err(AgentError::Cancelled) => return self.finish(Err(AgentError::Cancelled)),
+                kept => kept?.map(|text| {
                     prompt = Some(text.clone());
                     Message::user_with_images(text, images)
-                });
+                }),
+            };
             self.land_input(preamble, kept);
         }
         let Some(message) = prompt else {
@@ -336,6 +339,10 @@ impl<'h> Agent<'h> {
         if top_level {
             maki_otel::emit::active_time(busy_since.elapsed());
         }
+        self.finish(result)
+    }
+
+    fn finish(&mut self, result: Result<DoneReason, AgentError>) -> Result<DoneReason, AgentError> {
         let reason = match result {
             Ok(reason) => reason,
             Err(AgentError::Cancelled) => {
@@ -563,13 +570,17 @@ impl<'h> Agent<'h> {
         if blank(&message) && images == 0 {
             return Ok(Some(String::new()));
         }
-        let verdict = self
-            .hooks()
+        let hooks = self.hooks();
+        let verdict = hooks
             .fire(
                 AgentSlot::UserMessage,
                 || json!({ FIELD_TEXT: message, "images": images, "source": source.as_str() }),
             )
             .await;
+        // A layer that redacts must not be skipped by pressing Esc on it.
+        if self.cancel.is_cancelled() && hooks.wraps(AgentSlot::UserMessage) {
+            return Err(AgentError::Cancelled);
+        }
         let dropped = |reason: String| {
             info!(source = source.as_str(), %reason, "agent.user_message dropped the message");
             self.steer(SteerKind::MessageDropped, reason).map(|()| None)
@@ -2429,6 +2440,31 @@ mod tests {
 
             assert_eq!(reason, DoneReason::Cancelled);
             assert_ends_with_cancel_marker(&history);
+        });
+    }
+
+    /// The mock has no responses, so a message that got through would panic
+    /// on the request.
+    #[test]
+    fn cancel_during_user_message_layer_keeps_the_message_out() {
+        smol::block_on(async {
+            let (trigger, cancel) = CancelToken::new();
+            let trigger = Mutex::new(Some(trigger));
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            let mut agent = agent.with_cancel(cancel);
+            script(&agent.registry, move |_, _| {
+                if let Some(trigger) = trigger.lock().unwrap().take() {
+                    trigger.cancel();
+                }
+                Verdict::Unchanged
+            });
+
+            let reason = agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(reason, DoneReason::Cancelled);
+            assert!(history.is_empty());
         });
     }
 

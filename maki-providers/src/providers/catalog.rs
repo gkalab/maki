@@ -8,6 +8,7 @@
 //! their own [`CatalogProvider`] instance, created from the same
 //! [`ProviderData`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -28,7 +29,9 @@ use maki_storage::id::SessionRef;
 use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::anthropic::shared;
-use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::providers::openai_compat::{
+    DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
+};
 use crate::providers::{ResolvedAuth, Timeouts, http_client, opencode, user_agent};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
@@ -310,6 +313,8 @@ impl CatalogMeta {
             supports_vision: self.supports_vision,
             tier: None,
             provider_info: None,
+            extra: None,
+            effort: None,
         }
     }
 }
@@ -429,12 +434,12 @@ pub(crate) fn config_error(message: String) -> AgentError {
 }
 
 static CATALOG_PROVIDER_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "",
-    api_key_env: "",
-    base_url: "",
-    max_tokens_field: "max_tokens",
+    slug: Cow::Borrowed(""),
+    api_key_env: Cow::Borrowed(""),
+    base_url: Cow::Borrowed(""),
+    max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
     include_stream_usage: true,
-    provider_name: "catalog",
+    provider_name: Cow::Borrowed("catalog"),
 };
 
 static SHARED_CATALOG: OnceLock<Mutex<CatalogData>> = OnceLock::new();
@@ -496,6 +501,20 @@ pub fn catalog_provider_if_available(provider_id: &str) -> Option<ProviderData> 
 fn with_provider_if_available<T>(slug: &str, f: impl FnOnce(&ProviderData) -> T) -> Option<T> {
     let guard = SHARED_CATALOG.get()?.lock().ok()?;
     guard.providers.get(slug).map(f)
+}
+
+/// The env var each catalog provider reads its key from, if one is set. A cold
+/// catalog gives nothing, because a fetch here would stall every spawn.
+pub(crate) fn key_vars_if_available() -> Vec<String> {
+    let Some(Ok(guard)) = SHARED_CATALOG.get().map(|catalog| catalog.lock()) else {
+        return Vec::new();
+    };
+    guard
+        .providers
+        .values()
+        .filter_map(ProviderData::env_key_set)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Non-blocking availability check for catalog-backed providers: true only when
@@ -1059,6 +1078,9 @@ mod tests {
     const PAID_INPUT_PRICE: f64 = 1.0;
     const PAID_CONTEXT: u32 = 128_000;
     const PAID_OUTPUT: u32 = 64_000;
+    /// Stands in for `OPENCODE_API_KEY`, which a dev running the tests may
+    /// well have set, and then the free fallback would never kick in.
+    const UNSET_KEY_ENV: &str = "MAKI_TEST_UNSET_KEY";
 
     #[test]
     fn new_rejects_no_auth() {
@@ -1393,10 +1415,7 @@ mod tests {
         let (_tmp, state_dir) = temp_state_dir();
         let provider = CatalogProvider {
             name: "Test".into(),
-            env: vec!["OPENCODE_API_KEY"]
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
+            env: vec![UNSET_KEY_ENV.into()],
             npm: "@ai-sdk/openai-compatible".into(),
             api: None,
             models: HashMap::new(),
@@ -1568,7 +1587,7 @@ mod tests {
             "opencode".into(),
             CatalogProvider {
                 name: "Opencode".into(),
-                env: vec!["OPENCODE_API_KEY".into()],
+                env: vec![UNSET_KEY_ENV.into()],
                 npm: "@ai-sdk/openai-compatible".into(),
                 api: Some("https://opencode.ai/zen/v1".into()),
                 models,
@@ -1688,8 +1707,11 @@ mod tests {
 
         let curated = &deepseek::SPEC.models()[0];
         let listed = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", curated_flash())).unwrap();
-        assert_eq!(listed.pricing.input, curated.pricing.input);
-        assert_eq!(listed.context_window, curated.context_window);
+        assert_eq!(
+            Some(listed.pricing.input),
+            curated.pricing.as_ref().map(|pricing| pricing.input)
+        );
+        assert_eq!(Some(listed.context_window), curated.context_window);
     }
 
     /// Curated rows match by prefix, so `deepseek-flash` answers for every id
@@ -1712,7 +1734,8 @@ mod tests {
             "the curated relative has vision"
         );
         assert_eq!(
-            sibling.family, curated.family,
+            Some(sibling.family),
+            curated.family,
             "which dialect a model speaks is still the relative's answer to give"
         );
 
@@ -1721,7 +1744,10 @@ mod tests {
             curated_flash()
         ))
         .unwrap();
-        assert_eq!(snapshot.pricing.input, curated.pricing.input);
+        assert_eq!(
+            Some(snapshot.pricing.input),
+            curated.pricing.as_ref().map(|pricing| pricing.input)
+        );
     }
 
     /// The catalog only outranks a relative where it has something to say.
@@ -1740,9 +1766,9 @@ mod tests {
             quiet.pricing.input, UNLISTED_INPUT_PRICE,
             "the catalog priced it, so it has to be the one answering below"
         );
-        assert_eq!(quiet.context_window, curated.context_window);
+        assert_eq!(Some(quiet.context_window), curated.context_window);
         assert_eq!(quiet.max_output_tokens, curated.max_output_tokens);
-        assert_eq!(quiet.supports_vision(), curated.vision);
+        assert_eq!(Some(quiet.supports_vision()), curated.supports_vision);
         assert_eq!(quiet.supports_thinking(), spec.supports_thinking);
     }
 
@@ -1918,7 +1944,7 @@ mod tests {
     }
 
     fn curated_flash() -> &'static str {
-        deepseek::SPEC.models()[0].prefixes[0]
+        &deepseek::SPEC.models()[0].prefixes[0]
     }
 
     fn sibling_model() -> String {
@@ -2514,8 +2540,6 @@ mod tests {
     #[test]
     fn catalog_all_models_public_fallback_shows_only_free() {
         let (_tmp, state_dir) = temp_state_dir();
-        // Provider with OPENCODE_API_KEY in env but no key set gets "public" fallback.
-        // Only free (zero-cost) models should appear in all_models.
         let mut models = HashMap::new();
         models.insert(
             "free-model".into(),
@@ -2551,14 +2575,13 @@ mod tests {
             "opencode".into(),
             CatalogProvider {
                 name: "Opencode".into(),
-                env: vec!["OPENCODE_API_KEY".into()],
+                env: vec![UNSET_KEY_ENV.into()],
                 npm: "@ai-sdk/openai-compatible".into(),
                 api: Some("https://opencode.ai/zen/v1".into()),
                 models,
             },
         );
 
-        // No OPENCODE_API_KEY set in env — falls back to "public"
         let data = CatalogData::from_index(providers, &state_dir);
 
         let opencode = data.providers.get("opencode").unwrap();

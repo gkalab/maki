@@ -1,34 +1,141 @@
 use std::io;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
+use maki_config::host_allowed;
+use maki_providers::plugin;
 use mlua::{Error as LuaError, Function, IntoLuaMulti, Lua, Result as LuaResult};
 use semver::Version;
 use tracing::warn;
+use url::Url;
 
 use crate::error::PluginError;
 
 pub use maki_config::Permission;
 
 pub(crate) const MANIFEST_FILE: &str = "plugin.toml";
+pub(crate) const NET_HOSTS_KEY: &str = "net_hosts";
 const MIN_MAKI_VERSION: &str = "min_maki_version";
 const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The hosts a plugin declared it talks to, or `None` when it declared no
+/// list at all.
+///
+/// The two are different answers, not a list and an empty one: `net = true`
+/// with no `net_hosts` predates the allowlist and keeps meaning "any public
+/// host", while a list present means exactly those hosts. Shared because every
+/// `maki.net` call in one plugin reads the same list.
+pub type NetHosts = Option<Arc<[String]>>;
+
+/// The slugs one plugin registered a provider for, captured when its `maki`
+/// global was built. Nothing on the Lua side names a plugin, so a plugin
+/// reaches its own providers and no one else's by construction rather than by
+/// a check it could be handed the wrong argument for.
+pub type OwnedSlugs = Arc<Mutex<Vec<String>>>;
+
+/// Where a plugin is allowed to send bytes, as one answer rather than two
+/// lists that a call site could consult one of.
+///
+/// A manifest can only name the hosts its author knew about. The origin of a
+/// provider *this plugin registered* is the other half, and only maki knows
+/// it: the user repoints a slug with `<SLUG>_BASE_URL` or `providers.toml`,
+/// and no `plugin.toml` written beforehand can have that host in it. Leaving
+/// it out made a provider's own `fetch_usage` unreachable for exactly the
+/// users who need it, while the codec went to that very origin with the very
+/// same credentials and was never questioned.
+#[derive(Clone, Default)]
+pub struct NetEgress {
+    declared: NetHosts,
+    providers: OwnedSlugs,
+}
+
+impl NetEgress {
+    pub fn new(declared: NetHosts) -> Self {
+        Self {
+            declared,
+            providers: OwnedSlugs::default(),
+        }
+    }
+
+    /// The manifest's list, for the one caller that has to answer "did this
+    /// plugin declare any hosts at all" before it can register a provider.
+    pub(crate) fn declared(&self) -> &NetHosts {
+        &self.declared
+    }
+
+    /// Records a slug [`crate::api::provider`] just registered. Kept here and
+    /// not beside the registration so the network layer cannot be given a
+    /// stale copy: both surfaces read this one cell.
+    pub(crate) fn owns(&self, slug: String) {
+        self.providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(slug);
+    }
+
+    pub(crate) fn owned(&self) -> OwnedSlugs {
+        Arc::clone(&self.providers)
+    }
+
+    /// Whether this plugin may reach `host`: its manifest says so, or `host`
+    /// is where maki itself would send the credentials of a provider it
+    /// registered.
+    pub(crate) fn allows(&self, host: &str) -> bool {
+        let Some(declared) = &self.declared else {
+            return true;
+        };
+        host_allowed(host, declared) || self.serves(host)
+    }
+
+    /// Whether `url` is on the origin of a provider this plugin registered,
+    /// as chosen by the user or by maki. See [`plugin::vouched_origin`].
+    pub(crate) fn vouches(&self, url: &Url) -> bool {
+        let origin = url.origin();
+        self.providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|slug| plugin::vouched_origin(slug))
+            .any(|vouched| vouched.origin() == origin)
+    }
+
+    fn serves(&self, host: &str) -> bool {
+        self.providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|slug| plugin::effective_host(slug))
+            .any(|origin| host_allowed(host, &[origin]))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PluginPermissions {
     allowed: [bool; Permission::COUNT],
+    net_hosts: NetHosts,
 }
 
 impl PluginPermissions {
     pub fn trusted() -> Self {
         Self {
             allowed: [true; Permission::COUNT],
+            net_hosts: None,
         }
     }
 
     pub fn denied() -> Self {
         Self {
             allowed: [false; Permission::COUNT],
+            net_hosts: None,
         }
+    }
+
+    pub fn net_hosts(&self) -> NetHosts {
+        self.net_hosts.clone()
+    }
+
+    pub fn set_net_hosts(&mut self, hosts: NetHosts) {
+        self.net_hosts = hosts;
     }
 
     /// Builds a set from the names an approval records.
@@ -65,7 +172,10 @@ impl PluginPermissions {
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(true);
         }
-        Self { allowed }
+        Self {
+            allowed,
+            net_hosts: net_hosts_from_manifest(manifest),
+        }
     }
 
     pub fn set(&mut self, perm: Permission, value: bool) {
@@ -136,11 +246,21 @@ impl Requested {
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(false);
         }
-        Self(PluginPermissions { allowed })
+        Self(PluginPermissions {
+            allowed,
+            net_hosts: net_hosts_from_manifest(manifest),
+        })
     }
 
     pub fn is_requested(&self, perm: Permission) -> bool {
         self.0.is_allowed(perm)
+    }
+
+    /// The hosts the manifest asks to reach, `None` for every host. A request,
+    /// like every other name in here, so the approval store is what decides
+    /// whether they are granted.
+    pub fn net_hosts(&self) -> Option<&[String]> {
+        self.0.net_hosts.as_deref()
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -160,13 +280,35 @@ impl Requested {
 
     /// Effective permissions for a managed package: the request and the user's
     /// approval must agree.
+    ///
+    /// The host list comes from the request alone. It is a narrowing the
+    /// package wrote about itself, and the approval it needs is the decision to
+    /// load the package at all, which the caller has already made by the time
+    /// the two are intersected.
     pub fn intersect(&self, approved: &PluginPermissions) -> PluginPermissions {
         let mut out = PluginPermissions::denied();
         for &perm in Permission::ALL {
             out.set(perm, self.0.is_allowed(perm) && approved.is_allowed(perm));
         }
+        out.set_net_hosts(self.0.net_hosts());
         out
     }
+}
+
+/// `[permissions] net_hosts = ["api.example.com", "*.example.com"]`.
+///
+/// An absent key is `None` and not an empty list: see [`NetHosts`]. Entries
+/// that are not strings are dropped, since a manifest cannot be trusted to be
+/// well formed and a malformed entry must not widen the list it appears in.
+fn net_hosts_from_manifest(manifest: &toml::Value) -> NetHosts {
+    let hosts = manifest
+        .get("permissions")?
+        .get(NET_HOSTS_KEY)?
+        .as_array()?
+        .iter()
+        .filter_map(|host| host.as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    Some(hosts.into())
 }
 
 /// Reads a package's requested permissions.
@@ -308,6 +450,11 @@ mod tests {
     use super::*;
 
     const PLUGIN: &str = "test-plugin";
+    const DECLARED_HOST: &str = "api.example.com";
+    const OTHER_HOST: &str = "elsewhere.example";
+    /// A slug no load ever registered, which is the state every slug is in
+    /// here: these run without a provider registry.
+    const UNREGISTERED_SLUG: &str = "not-a-provider";
 
     fn assert_denied(permissions: &PluginPermissions) {
         for &permission in Permission::ALL {
@@ -316,6 +463,23 @@ mod tests {
                 "{permission} should be denied"
             );
         }
+    }
+
+    /// The grant a registered provider adds is covered end to end by
+    /// `tests/provider_replay.rs`, where a real slug has a real origin.
+    /// What is worth pinning here is the other direction: owning a slug is
+    /// never a grant by itself, so a plugin cannot widen its own reach by
+    /// naming providers that do not resolve.
+    #[test_case(None, &[], OTHER_HOST, true ; "a_plugin_that_declared_nothing_is_unrestricted")]
+    #[test_case(Some(DECLARED_HOST), &[], DECLARED_HOST, true ; "a_declared_host_is_reachable")]
+    #[test_case(Some(DECLARED_HOST), &[], OTHER_HOST, false ; "and_nothing_else_is")]
+    #[test_case(Some(DECLARED_HOST), &[UNREGISTERED_SLUG], OTHER_HOST, false ; "owning_a_slug_that_serves_nothing_grants_nothing")]
+    fn egress_reaches(declared: Option<&str>, owns: &[&str], host: &str, expected: bool) {
+        let egress = NetEgress::new(declared.map(|host| Arc::from(vec![host.to_owned()])));
+        for slug in owns {
+            egress.owns((*slug).to_owned());
+        }
+        assert_eq!(egress.allows(host), expected);
     }
 
     #[test]
@@ -348,6 +512,35 @@ mod tests {
         assert!(!p.is_allowed(Permission::Net));
         assert!(p.is_allowed(Permission::Run));
         assert!(p.is_allowed(Permission::Env));
+    }
+
+    /// Absent and empty are different answers: only a list that is there
+    /// narrows what `net = true` already allows.
+    #[test_case("[permissions]\nnet = true\n", None ; "absent_list_stays_unrestricted")]
+    #[test_case(
+        "[permissions]\nnet = true\nnet_hosts = [\"api.example.com\", \"*.example.com\"]\n",
+        Some(vec!["api.example.com".to_owned(), "*.example.com".to_owned()])
+        ; "declared_hosts_are_carried"
+    )]
+    #[test_case("[permissions]\nnet_hosts = []\n", Some(Vec::new()) ; "an_empty_list_reaches_nothing")]
+    #[test_case("[permissions]\nnet_hosts = [1]\n", Some(Vec::new()) ; "a_malformed_entry_widens_nothing")]
+    fn net_hosts_from_a_manifest(manifest: &str, expected: Option<Vec<String>>) {
+        let value: toml::Value = toml::from_str(manifest).unwrap();
+        let hosts = PluginPermissions::from_manifest(&value).net_hosts();
+        assert_eq!(hosts.as_deref().map(<[String]>::to_vec), expected);
+    }
+
+    #[test]
+    fn a_requested_host_list_survives_intersection_with_an_approval() {
+        let value: toml::Value =
+            toml::from_str("[permissions]\nnet = true\nnet_hosts = [\"api.example.com\"]\n")
+                .unwrap();
+        let requested = Requested::from_manifest(&value);
+        let effective = requested.intersect(&PluginPermissions::trusted());
+        assert_eq!(
+            effective.net_hosts().as_deref().map(<[String]>::to_vec),
+            Some(vec!["api.example.com".to_owned()])
+        );
     }
 
     #[test]

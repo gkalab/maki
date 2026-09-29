@@ -4,25 +4,30 @@
 //! + cache reads/writes because the context window limit applies to all of them combined.
 
 use std::any::Any;
-use std::cmp::Ordering;
-use std::fmt;
 use std::ops::AddAssign;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use jiff::Timestamp;
 use maki_config::ModelPolicy;
 use maki_storage::sessions::{Effort, MIN_THINKING_BUDGET, StoredTokenUsage};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+use tracing::debug;
 
 use crate::model_registry;
 use crate::providers::catalog::{self, CatalogMeta};
-use crate::providers::{anthropic, custom, dynamic};
+use crate::providers::{anthropic, custom, plugin};
 use crate::spec::{ProviderRegistry, ProviderSpec};
-use crate::types::{FALLBACK_MAX_THINKING_BUDGET, THINKING_ADAPTIVE, THINKING_OFF};
+use crate::types::{
+    EffortDialect, FALLBACK_MAX_THINKING_BUDGET, THINKING_ADAPTIVE, THINKING_OFF, dialect,
+};
+pub use maki_config::providers::ModelTier;
 use maki_config::providers::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
+/// What a plugin's model row falls back to for a limit it leaves out.
+const DECLARED_MAX_OUTPUT_TOKENS: u32 = 16384;
+const DECLARED_CONTEXT_WINDOW: u32 = 128_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -30,10 +35,6 @@ pub enum ModelError {
     InvalidFormat,
     #[error("unsupported provider '{0}'")]
     UnsupportedProvider(String),
-    #[error("unknown model '{0}'")]
-    UnknownModel(String),
-    #[error("invalid model tier '{0}' (expected: strong, medium, weak)")]
-    InvalidTier(String),
     #[error("no allowed model for {0}/{1}")]
     NoAllowedModel(String, ModelTier),
     #[error("no default model for {0}/{1}")]
@@ -45,7 +46,7 @@ pub enum ModelError {
 /// Also the shape of a rate in `models/<slug>.toml`. None of the four rates may
 /// ever gain a `#[serde(default)]`: a curated row that forgets one has to fail
 /// loudly instead of quietly billing the user zero.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
@@ -60,17 +61,101 @@ pub struct ModelPricing {
 
 /// Metadata discovered at runtime from a provider's `/models` endpoint.
 /// All fields optional -- most providers only return an ID.
-#[derive(Debug, Clone, Default)]
+///
+/// `Deserialize` is what a `list_models` hook in a Lua plugin answers with, so
+/// the shape a plugin may state is this one minus [`Self::provider_info`],
+/// which is a stash only the Rust provider that filled it can read back. Every
+/// optional field defaults, so an omitted one stays distinguishable from a
+/// published negative. `Serialize` is the same shape going the other way, so a
+/// golden records every field there is rather than a hand-picked few.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ModelInfo {
     pub id: String,
+    #[serde(default)]
     pub context_window: Option<u32>,
+    #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    #[serde(default)]
     pub pricing: Option<ModelPricing>,
+    #[serde(default)]
     pub supports_thinking: Option<bool>,
+    #[serde(default)]
     pub supports_vision: Option<bool>,
+    #[serde(default)]
     pub tier: Option<ModelTier>,
     /// Store of additional metadata from the provider.
+    #[serde(skip)]
     pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
+    /// Opaque JSON a declaration's `list_models` attaches to the row, handed
+    /// back to its `build_body` on every request for the model
+    /// (`opts.model_info` in Lua). Never serialized, like
+    /// [`Self::provider_info`]: the listing goldens predate it, so the request
+    /// bodies of a discovery run are what pin it.
+    #[serde(default, skip_serializing)]
+    pub extra: Option<Value>,
+    /// What the model says about effort, narrowing its declared dialect (see
+    /// [`ModelEffort::refine`]). Never serialized, for the reason
+    /// [`Self::extra`] is not.
+    #[serde(default, skip_serializing)]
+    pub effort: Option<ModelEffort>,
+}
+
+/// A listed model's own effort levels and off switch. The codec folds them
+/// into the declared dialect first, so the effort snaps once, against the
+/// result. Decoding goes through [`Self::known_levels`], the one place a level
+/// maki has no name for is dropped.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEffort {
+    /// Ascending. Empty inherits the declared levels, since a model that
+    /// named none, or only unknown ones, said nothing usable.
+    #[serde(default, deserialize_with = "known_efforts")]
+    pub supported: Vec<Effort>,
+    /// `true` sends [`dialect::OFF`] for Off, `false` sends nothing, and
+    /// absent keeps what the declared dialect does.
+    #[serde(default)]
+    pub send_off: Option<bool>,
+}
+
+impl ModelEffort {
+    /// The declared dialect as this model speaks it. `adaptive` stays the
+    /// declaration's: a model lists levels, not a default.
+    pub fn refine<'a>(&'a self, declared: &EffortDialect<'a>) -> EffortDialect<'a> {
+        EffortDialect {
+            supported: match self.supported.as_slice() {
+                [] => declared.supported,
+                listed => listed,
+            },
+            adaptive: declared.adaptive,
+            off: match self.send_off {
+                Some(true) => Some(dialect::OFF),
+                Some(false) => None,
+                None => declared.off,
+            },
+        }
+    }
+
+    /// What [`Self::supported`] keeps of the names a provider listed.
+    fn known_levels(listed: &[Value]) -> Vec<Effort> {
+        let mut efforts: Vec<Effort> = listed
+            .iter()
+            .filter_map(|raw| {
+                let known = raw.as_str().and_then(|name| name.parse().ok());
+                if known.is_none() {
+                    debug!(effort = %raw, "dropping an effort level maki has no name for");
+                }
+                known
+            })
+            .collect();
+        efforts.sort_unstable();
+        efforts
+    }
+}
+
+fn known_efforts<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Effort>, D::Error> {
+    Ok(ModelEffort::known_levels(&Vec::<Value>::deserialize(
+        deserializer,
+    )?))
 }
 
 impl ModelInfo {
@@ -85,7 +170,7 @@ impl ModelInfo {
 /// Cache rates are missing on purpose: Anthropic derives them from `input` with
 /// the same multipliers it uses for standard pricing, so storing them would just
 /// invite the two copies to drift apart.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct FastPricing {
     pub input: f64,
     pub output: f64,
@@ -147,129 +232,122 @@ pub enum ModelFamily {
     Synthetic,
 }
 
-/// Ordering is a cost guarantee (a subagent may never run on a pricier tier
-/// than its parent), so the strength is written down in [`ModelTier::strength`]
-/// instead of being inherited from declaration order, where inserting or moving
-/// a variant would silently redefine "stronger". `Ord` stays because the tier is
-/// also a `BTreeMap` key in `model_registry`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelTier {
-    Weak,
-    Medium,
-    Strong,
-    Compaction,
-}
-
-impl ModelTier {
-    /// `Compaction` is not a capability tier: it is a user-assigned slot for the
-    /// cheap model that rewrites history. It therefore ranks below every agent
-    /// tier, which makes it the tightest ceiling a parent can impose - a session
-    /// on a compaction model hands its children that same model rather than
-    /// letting them escalate to a capability tier.
-    const fn strength(self) -> u8 {
-        match self {
-            Self::Compaction => 0,
-            Self::Weak => 1,
-            Self::Medium => 2,
-            Self::Strong => 3,
-        }
-    }
-
-    /// The single named way to cap a requested tier, so no call site re-derives
-    /// the cost rule with an ad-hoc comparison.
-    pub fn capped_at(self, ceiling: Self) -> Self {
-        if self.strength() <= ceiling.strength() {
-            self
-        } else {
-            ceiling
-        }
-    }
-}
-
-impl Ord for ModelTier {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.strength().cmp(&other.strength())
-    }
-}
-
-impl PartialOrd for ModelTier {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl fmt::Display for ModelTier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Weak => "weak",
-            Self::Medium => "medium",
-            Self::Strong => "strong",
-            Self::Compaction => "compaction",
-        })
-    }
-}
-
-impl FromStr for ModelTier {
-    type Err = ModelError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "weak" => Ok(Self::Weak),
-            "medium" => Ok(Self::Medium),
-            "strong" => Ok(Self::Strong),
-            "compaction" => Ok(Self::Compaction),
-            other => Err(ModelError::InvalidTier(other.to_string())),
-        }
-    }
-}
-
-impl From<maki_config::providers::Tier> for ModelTier {
-    fn from(t: maki_config::providers::Tier) -> Self {
-        use maki_config::providers::Tier;
-        match t {
-            Tier::Weak => Self::Weak,
-            Tier::Medium => Self::Medium,
-            Tier::Strong => Self::Strong,
-            Tier::Compaction => Self::Compaction,
-        }
-    }
-}
-
-/// One curated row, deserialized straight from `models/<slug>.toml`, so the
-/// file and this struct cannot drift apart. `max_output_tokens` is the only
-/// field allowed a serde default: TOML has no null, and an absent limit really
-/// does mean "the provider never published one". Everything else missing, or
-/// spelled wrong, is a mistake worth hearing about.
-#[derive(Debug, Deserialize)]
+/// One model as a declaration states it, whoever declared it: a curated row
+/// of `models/<slug>.toml` (see [`crate::manifest`]), a row of a plugin's
+/// `models` table, or a `providers.toml` model. Keyed by prefix, see
+/// [`lookup_entry`].
+///
+/// `Deserialize` is the plugin surface, decoded straight off the Lua table, so
+/// its defaults are the ones a plugin author is promised. A curated file
+/// states every field it has instead, and `family` and `default` are keys
+/// only that file knows. `Serialize` mirrors `Deserialize` field for field,
+/// defaults included, so a declared row survives a round trip.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelEntry {
-    /// `'static` because the rest of the crate hands these out as model ids
-    /// that outlive any borrow; [`crate::manifest::leak_prefixes`] pays for it.
-    #[serde(deserialize_with = "crate::manifest::leak_prefixes")]
-    pub prefixes: &'static [&'static str],
-    pub tier: ModelTier,
-    pub family: ModelFamily,
-    /// Gates vision-only tools (`view_image`) and image blocks at request time.
-    pub vision: bool,
-    pub default: bool,
-    pub pricing: ModelPricing,
+    /// Every id this row answers for. `prefixes[0]` is the canonical id,
+    /// used wherever a concrete model has to be named.
+    pub prefixes: Vec<String>,
     #[serde(default)]
+    pub tier: ModelTier,
+    #[serde(default)]
+    pub supports_tool_examples: Option<bool>,
+    #[serde(default)]
+    pub supports_thinking: Option<bool>,
+    #[serde(default)]
+    pub requires_thinking: bool,
+    /// Gates vision-only tools (`view_image`) and image blocks at request time.
+    #[serde(default)]
+    pub supports_vision: Option<bool>,
+    /// `None` when the provider never published one.
+    #[serde(default = "declared_max_output_tokens")]
     pub max_output_tokens: Option<u32>,
-    pub context_window: u32,
+    /// `None` only for a `providers.toml` model that leaves it to discovery.
+    #[serde(default = "declared_context_window")]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub pricing: Option<ModelPricing>,
+    #[serde(default)]
+    pub thinking_fields: Option<ThinkingFields>,
+    /// `None` speaks the family of the spec the row is served through.
+    #[serde(skip)]
+    pub family: Option<ModelFamily>,
+    /// The model its tier resolves to when nothing else picked one.
+    #[serde(skip)]
+    pub default: bool,
 }
 
+fn declared_max_output_tokens() -> Option<u32> {
+    Some(DECLARED_MAX_OUTPUT_TOKENS)
+}
+
+fn declared_context_window() -> Option<u32> {
+    Some(DECLARED_CONTEXT_WINDOW)
+}
+
+impl ModelEntry {
+    pub(crate) fn canonical_id(&self) -> Option<&str> {
+        self.prefixes.first().map(String::as_str)
+    }
+
+    /// The row as the model `id`, served through `base`. A limit the row
+    /// leaves out is the base's fallback, while an unstated flag stays
+    /// unstated, so discovery and the spec still get to answer it.
+    pub(crate) fn to_model(&self, slug: &str, base: &ProviderSpec, id: String) -> Model {
+        Model {
+            id,
+            provider: Arc::from(slug),
+            tier: self.tier,
+            family: self.family.unwrap_or(base.family),
+            supports_tool_examples_override: self.supports_tool_examples,
+            thinking_override: ThinkingSupport::from_flags(
+                self.supports_thinking,
+                self.requires_thinking,
+            ),
+            supports_vision_override: self.supports_vision,
+            supports_fast_override: None,
+            pricing: self.pricing.clone().unwrap_or_default(),
+            subsidised_by: None,
+            discovered_free: false,
+            max_output_tokens: self.max_output_tokens.or(base.fallback_max_output),
+            turn_output_tokens: None,
+            context_window: self.context_window.unwrap_or(base.fallback_context_window),
+            thinking_fields: self.thinking_fields.clone().map(Box::new),
+        }
+    }
+
+    /// This row as the catalogue reports it. The `supports_*` flags are
+    /// `Option` on both sides, so an unstated one stays unstated rather than
+    /// becoming a published negative. `provider_info` is a stash only the Rust
+    /// provider that filled it reads back, so a declared row never has one.
+    pub(crate) fn to_info(&self) -> ModelInfo {
+        ModelInfo {
+            id: self.canonical_id().unwrap_or_default().to_string(),
+            context_window: self.context_window,
+            max_output_tokens: self.max_output_tokens,
+            pricing: self.pricing.clone(),
+            supports_thinking: self.supports_thinking,
+            supports_vision: self.supports_vision,
+            tier: Some(self.tier),
+            provider_info: None,
+            extra: None,
+            effort: None,
+        }
+    }
+}
+
+/// Longest matching prefix wins, so `glm-5-code` outranks `glm-5` for
+/// `glm-5-code-plus` however the rows happen to be ordered.
 pub(crate) fn lookup_entry<'a>(
     entries: &'a [ModelEntry],
     model_id: &str,
-) -> Result<&'a ModelEntry, ModelError> {
+) -> Option<&'a ModelEntry> {
     entries
         .iter()
-        .flat_map(|e| e.prefixes.iter().map(move |p| (p, e)))
-        .filter(|(p, _)| model_id.starts_with(*p))
-        .max_by_key(|(p, _)| p.len())
-        .map(|(_, e)| e)
-        .ok_or_else(|| ModelError::UnknownModel(model_id.to_string()))
+        .flat_map(|entry| entry.prefixes.iter().map(move |prefix| (prefix, entry)))
+        .filter(|(prefix, _)| model_id.starts_with(prefix.as_str()))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, entry)| entry)
 }
 
 const SNAPSHOT_DATE_DIGITS: usize = 8;
@@ -315,7 +393,7 @@ struct ModelSources<'a> {
 
 impl<'a> ModelSources<'a> {
     fn resolve(spec: &'a ProviderSpec, model_id: &str) -> Self {
-        let entry = lookup_entry(spec.models(), model_id).ok();
+        let entry = lookup_entry(spec.models(), model_id);
         let exact = entry.is_some_and(|entry| names_exactly(entry, model_id));
         Self {
             entry,
@@ -350,7 +428,7 @@ impl ModelFamily {
     }
 
     /// Fallback for models missing from the static tables; per-model truth
-    /// lives in `ModelEntry::vision`.
+    /// lives in `ModelEntry::supports_vision`.
     pub fn supports_vision(self) -> bool {
         matches!(self, Self::Claude | Self::Gpt | Self::Gemini)
     }
@@ -390,7 +468,8 @@ fn local_thinking_overlay(
 
 /// `Required` marks APIs that reject requests with thinking disabled;
 /// [`crate::RequestOptions::clamped`] raises `Off` to minimal effort for them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ThinkingSupport {
     No,
     Yes,
@@ -481,16 +560,11 @@ impl Model {
         let discovered = model_registry::discovered(base.slug, model_id);
         let discovered = discovered.as_ref();
         let tier = model_registry::tier_for(&spec, base.slug, entry.map(|e| e.tier));
-        let family = entry.map_or(base.family, |entry| entry.family);
+        let family = entry.and_then(|entry| entry.family).unwrap_or(base.family);
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
         let pricing = discovered_pricing
             .cloned()
-            .or_else(|| {
-                sources.pick(
-                    |entry| Some(entry.pricing.clone()),
-                    |meta| meta.pricing.clone(),
-                )
-            })
+            .or_else(|| sources.pick(|entry| entry.pricing.clone(), |meta| meta.pricing.clone()))
             .unwrap_or_default();
         let max_output_tokens = discovered
             .and_then(|info| info.max_output_tokens)
@@ -499,7 +573,7 @@ impl Model {
         let context_window = discovered
             .and_then(|info| info.context_window)
             .or_else(|| anthropic::shared::long_context_window(model_id))
-            .or_else(|| sources.pick(|entry| Some(entry.context_window), |meta| meta.context))
+            .or_else(|| sources.pick(|entry| entry.context_window, |meta| meta.context))
             .unwrap_or(base.fallback_context_window);
         let (thinking_override, thinking_fields) = local_thinking_overlay(slug, model_id);
         Self {
@@ -583,7 +657,7 @@ impl Model {
             .and_then(|d| d.supports_vision)
             .or_else(|| {
                 ModelSources::resolve(spec, &self.id)
-                    .pick(|entry| Some(entry.vision), |meta| meta.supports_vision)
+                    .pick(|entry| entry.supports_vision, |meta| meta.supports_vision)
             })
             .unwrap_or_else(|| self.family.supports_vision())
     }
@@ -758,8 +832,7 @@ impl Model {
         }
         let entry = ProviderRegistry::find_default_for_tier(slug, tier)
             .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-        let model_id = entry.prefixes[0];
-        Self::from_spec(&format!("{slug}/{model_id}"))
+        Self::from_spec(&format!("{slug}/{}", entry.prefixes[0]))
     }
 
     pub fn from_tier_with_policy(
@@ -779,7 +852,7 @@ impl Model {
         spec.models()
             .iter()
             .filter(|entry| entry.tier == tier)
-            .flat_map(|entry| entry.prefixes)
+            .flat_map(|entry| &entry.prefixes)
             .map(|model_id| format!("{slug}/{model_id}"))
             .find(|spec| policy.allows(spec))
             .map(|spec| Self::from_spec(&spec))
@@ -788,7 +861,7 @@ impl Model {
     }
 
     pub fn from_tier_dynamic(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if let Some(model) = dynamic::find_model_for_tier(slug, tier) {
+        if let Some(model) = plugin::find_model_for_tier(slug, tier) {
             return Ok(model);
         }
         // One providers.toml read, three answers: a model declared at this tier,
@@ -803,13 +876,13 @@ impl Model {
                     .iter()
                     .find(|e| e.default && e.tier == tier)
                     .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-                return Ok(Self::from_base(base, slug, entry.prefixes[0]));
+                return Ok(Self::from_base(base, slug, &entry.prefixes[0]));
             }
             custom::TierLookup::Unknown => {}
         }
-        // Builtin or dynamic slug: resolve the base default under the slug
-        // (dynamic slugs route through `base_for_slug`).
-        if ProviderRegistry::get(slug).is_some() || dynamic::base_for_slug(slug).is_some() {
+        // A plugin slug has no models table of its own to default from, so it
+        // resolves through the base it borrowed.
+        if ProviderRegistry::get(slug).is_some() || plugin::base_for_slug(slug).is_some() {
             return Self::from_tier(slug, tier);
         }
         Err(ModelError::UnsupportedProvider(slug.to_string()))
@@ -825,19 +898,21 @@ impl Model {
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
 
-        // Precedence: builtin, then dynamic script, then providers.toml custom,
-        // then models.dev catalogue sub-provider.
-        // Discovery drops any script slug a builtin or custom entry already owns,
-        // so a script and a custom provider can never share a slug here.
+        // Order only decides the last step, because the first three cannot
+        // collide: a declaration claiming a built-in slug inherits that row
+        // instead of restating it, and registration refuses a slug
+        // `providers.toml` already defines. models.dev comes last because it
+        // is the open ended one, and anything defined on this machine should
+        // beat it.
         if let Some(spec) = ProviderRegistry::get(slug) {
             return Ok(Self::from_base(spec, slug, model_id));
         }
 
-        if let Some(model) = dynamic::lookup_model(slug, model_id) {
+        if let Some(model) = plugin::lookup_model(slug, model_id) {
             return Ok(model);
         }
 
-        if let Some(base) = dynamic::base_for_slug(slug) {
+        if let Some(base) = plugin::base_for_slug(slug) {
             return Ok(Self::from_base(base, slug, model_id));
         }
 
@@ -876,7 +951,11 @@ impl Model {
             return false;
         };
         let sources = ModelSources::resolve(spec, &self.id);
-        sources.exact && sources.entry.is_some_and(|entry| entry.pricing.is_zero())
+        sources.exact
+            && sources
+                .entry
+                .and_then(|entry| entry.pricing.as_ref())
+                .is_some_and(ModelPricing::is_zero)
     }
 
     /// Free, metered, or unknown. Three states rather than [`Self::is_free`]'s
@@ -1020,6 +1099,8 @@ impl AddAssign for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ThinkingConfig;
+    use serde_json::json;
     use test_case::test_case;
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
@@ -1044,10 +1125,6 @@ mod tests {
     ];
 
     const EPSILON: f64 = 1e-10;
-
-    /// Declaration index of `Compaction`, which a derived `Ord` would read as
-    /// the strongest tier.
-    const COMPACTION_DECLARED_LAST: u8 = 3;
 
     /// The only builtin whose rates move with the wall clock.
     const SCHEDULED_PROVIDERS: [&str; 1] = ["deepseek"];
@@ -1075,13 +1152,14 @@ mod tests {
         "the table has to disagree, or preferring the bill proves nothing";
     const PAID_PRICING: ModelPricing = ModelPricing::per_million(3.0, 15.0, 0.0, 0.0);
 
+    /// Two rows where one prefix extends the other, so row order cannot be
+    /// what decides the match.
+    const PREFIX_TABLE: [&[&str]; 3] = [&["glm-5"], &["glm-5-code"], &["claude-sonnet-4-5"]];
+
     #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5"; "the id itself")]
     #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5-20250929"; "anthropic snapshot")]
     #[test_case(&["gpt-5.4"], "gpt-5.4-2026-03-11"; "openai snapshot")]
-    fn a_curated_row_names_its_own_dated_snapshots(
-        prefixes: &'static [&'static str],
-        model_id: &str,
-    ) {
+    fn a_curated_row_names_its_own_dated_snapshots(prefixes: &[&str], model_id: &str) {
         assert!(names_exactly(&entry_named(prefixes), model_id));
     }
 
@@ -1092,29 +1170,70 @@ mod tests {
     #[test_case(&["glm-5"], "glm-5-code"; "named variant")]
     #[test_case(&["claude-opus-5"], "claude-opus-5-2"; "version bump behind a dash")]
     #[test_case(&["deepseek-flash"], "deepseek-flash-preview"; "preview of a relative")]
-    fn a_curated_row_does_not_name_its_relatives(
-        prefixes: &'static [&'static str],
-        model_id: &str,
-    ) {
+    fn a_curated_row_does_not_name_its_relatives(prefixes: &[&str], model_id: &str) {
         let entry = entry_named(prefixes);
         assert!(!names_exactly(&entry, model_id));
         assert!(
-            lookup_entry(std::slice::from_ref(&entry), model_id).is_ok(),
+            lookup_entry(std::slice::from_ref(&entry), model_id).is_some(),
             "still the right row for family and tier, just not for rates"
         );
     }
 
-    fn entry_named(prefixes: &'static [&'static str]) -> ModelEntry {
+    fn entry_named(prefixes: &[&str]) -> ModelEntry {
         ModelEntry {
-            prefixes,
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: false,
-            default: false,
-            pricing: ModelPricing::default(),
-            max_output_tokens: None,
-            context_window: 0,
+            prefixes: prefixes.iter().map(ToString::to_string).collect(),
+            ..ModelEntry::default()
         }
+    }
+
+    fn curated_table() -> Vec<ModelEntry> {
+        PREFIX_TABLE.iter().map(|p| entry_named(p)).collect()
+    }
+
+    #[test_case("glm-5-code-plus", Some(1) ; "the_longer_of_two_matches")]
+    #[test_case("glm-5.4", Some(0) ; "only_the_shorter_matches")]
+    #[test_case("claude-sonnet-4-5-20250929", Some(2) ; "dated_snapshot")]
+    #[test_case("gpt-5.6", None ; "no_row_matches")]
+    fn longest_prefix_wins(model_id: &str, expected: Option<usize>) {
+        let entries = curated_table();
+
+        let matched = lookup_entry(&entries, model_id);
+
+        assert_eq!(
+            matched.map(|entry| entry.prefixes.as_slice()),
+            expected.map(|row| entries[row].prefixes.as_slice())
+        );
+    }
+
+    const DECLARED_ID: &str = "acme-large";
+    const UNKNOWN_FIELD: &str = "unknown field";
+
+    fn declared(row: Value) -> Result<ModelEntry, serde_json::Error> {
+        serde_json::from_value(row)
+    }
+
+    /// The plugin surface keeps the defaults it documents, which the curated
+    /// file sharing the row must not tighten.
+    #[test]
+    fn a_declared_row_defaults_what_it_leaves_out() {
+        let row = declared(json!({ "prefixes": [DECLARED_ID] })).unwrap();
+
+        assert_eq!(row.tier, ModelTier::Medium);
+        assert_eq!(row.max_output_tokens, Some(DECLARED_MAX_OUTPUT_TOKENS));
+        assert_eq!(row.context_window, Some(DECLARED_CONTEXT_WINDOW));
+        assert!(row.pricing.is_none());
+        assert!(row.supports_vision.is_none());
+        assert!(!row.requires_thinking);
+    }
+
+    /// Keys only the curated file knows stay out of the plugin surface.
+    #[test_case("family", json!("generic") ; "family")]
+    #[test_case("default", json!(true) ; "default")]
+    #[test_case("vision", json!(true) ; "vision")]
+    fn a_declared_row_refuses_curated_keys(key: &str, value: Value) {
+        let error = declared(json!({ "prefixes": [DECLARED_ID], (key): value })).unwrap_err();
+
+        assert!(error.to_string().contains(UNKNOWN_FIELD), "{error}");
     }
 
     #[test_case(999, "999"         ; "under_thousand")]
@@ -1335,11 +1454,14 @@ mod tests {
     fn fast_pricing_is_always_a_premium() {
         for spec in ProviderRegistry::builtins() {
             for entry in spec.models() {
-                let Some(fast) = &entry.pricing.fast else {
+                let Some(pricing) = &entry.pricing else {
+                    continue;
+                };
+                let Some(fast) = &pricing.fast else {
                     continue;
                 };
                 assert!(
-                    fast.input >= entry.pricing.input && fast.output >= entry.pricing.output,
+                    fast.input >= pricing.input && fast.output >= pricing.output,
                     "{}/{}: fast pricing must not be cheaper than standard",
                     spec.slug,
                     entry.prefixes[0],
@@ -1403,62 +1525,6 @@ mod tests {
                 assert!(model.context_window >= max_output);
             }
         }
-    }
-
-    #[test_case(ModelTier::Strong, ModelTier::Weak, ModelTier::Weak ; "strong_child_capped_to_weak_parent")]
-    #[test_case(ModelTier::Weak, ModelTier::Strong, ModelTier::Weak ; "weak_child_stays_weak_under_strong_parent")]
-    #[test_case(ModelTier::Medium, ModelTier::Medium, ModelTier::Medium ; "equal_tiers_pass_through")]
-    #[test_case(ModelTier::Strong, ModelTier::Compaction, ModelTier::Compaction ; "strong_child_capped_to_compaction_parent")]
-    #[test_case(ModelTier::Medium, ModelTier::Compaction, ModelTier::Compaction ; "medium_child_capped_to_compaction_parent")]
-    #[test_case(ModelTier::Compaction, ModelTier::Strong, ModelTier::Compaction ; "compaction_child_is_not_escalated")]
-    fn capped_at_never_exceeds_ceiling(
-        requested: ModelTier,
-        ceiling: ModelTier,
-        expected: ModelTier,
-    ) {
-        assert_eq!(requested.capped_at(ceiling), expected);
-        assert!(requested.capped_at(ceiling) <= ceiling);
-    }
-
-    #[test]
-    fn every_tier_under_a_compaction_ceiling_stays_at_compaction() {
-        for &tier in &TIERS {
-            assert_eq!(tier.capped_at(ModelTier::Compaction), ModelTier::Compaction);
-        }
-    }
-
-    /// Fails if the variants get reordered (the hand-written strength table
-    /// would no longer be the thing that disagrees with declaration order) or if
-    /// the explicit `Ord` is ever replaced by a derive, which would rank
-    /// `Compaction` above `Strong` and turn the subagent cap into a no-op.
-    #[test]
-    fn tier_order_is_explicit_not_declaration_order() {
-        assert_eq!(ModelTier::Compaction as u8, COMPACTION_DECLARED_LAST);
-        assert!(ModelTier::Compaction < ModelTier::Weak);
-
-        let mut tiers = TIERS;
-        tiers.sort();
-        assert_eq!(
-            tiers,
-            [
-                ModelTier::Compaction,
-                ModelTier::Weak,
-                ModelTier::Medium,
-                ModelTier::Strong
-            ]
-        );
-    }
-
-    #[test]
-    fn tier_display_roundtrip() {
-        for &tier in &TIERS {
-            let s = tier.to_string();
-            assert_eq!(s.parse::<ModelTier>().unwrap(), tier);
-        }
-        assert!(matches!(
-            "turbo".parse::<ModelTier>(),
-            Err(ModelError::InvalidTier(_))
-        ));
     }
 
     #[test]
@@ -1851,5 +1917,60 @@ mod tests {
         assert!(model.billed_cost(&INPUT_ONLY, false).is_some());
         assert_eq!(model.subsidised_list_cost(&INPUT_ONLY, false), None);
         assert_eq!(model.subsidy_source(), None);
+    }
+
+    #[test_case(json!({ "supported": ["high", "bogus", 1, null, "LOW", "low", "none"] }), &[Effort::Low, Effort::High] ; "unknown_names_dropped_and_sorted")]
+    #[test_case(json!({ "supported": ["none", "bogus"] }), &[] ; "only_unknown_names_leave_it_empty")]
+    #[test_case(json!({}), &[] ; "absent_is_empty")]
+    fn model_effort_keeps_the_known_levels_in_order(authored: Value, expected: &[Effort]) {
+        let effort: ModelEffort = serde_json::from_value(authored).unwrap();
+        assert_eq!(effort.supported, expected);
+    }
+
+    #[test]
+    fn model_effort_refuses_an_unknown_key() {
+        assert!(serde_json::from_value::<ModelEffort>(json!({ "sendoff": true })).is_err());
+    }
+
+    /// Snapped once, against the levels the model listed, falling back to
+    /// the declared ones when it listed none.
+    #[test_case(&[Effort::High, Effort::XHigh], ThinkingConfig::Effort(Effort::XHigh), Some("xhigh") ; "listed_xhigh_passes_through")]
+    #[test_case(&[Effort::High, Effort::XHigh], ThinkingConfig::Effort(Effort::Max), Some("xhigh") ; "max_snaps_to_listed_xhigh")]
+    #[test_case(&[Effort::Minimal, Effort::Low], ThinkingConfig::Adaptive, Some("low") ; "declared_adaptive_snaps_into_listed")]
+    #[test_case(&[], ThinkingConfig::Effort(Effort::XHigh), Some("high") ; "nothing_listed_inherits_declared")]
+    fn refined_dialect_snaps_against_the_listed_levels(
+        supported: &[Effort],
+        thinking: ThinkingConfig,
+        expected: Option<&str>,
+    ) {
+        let effort = ModelEffort {
+            supported: supported.to_vec(),
+            send_off: None,
+        };
+        let model = ladder_model(ThinkingSupport::Yes, None);
+        assert_eq!(
+            thinking.effort_str(&effort.refine(&dialect::PREFER_HIGH), &model),
+            expected
+        );
+    }
+
+    #[test_case(&dialect::PREFER_HIGH, Some(true), Some(dialect::OFF) ; "send_off_sends_none")]
+    #[test_case(&dialect::CODING_PLAN, Some(false), None ; "no_send_off_silences_a_declared_opt_out")]
+    #[test_case(&dialect::CODING_PLAN, None, Some(dialect::OFF) ; "absent_inherits_the_declared_opt_out")]
+    #[test_case(&dialect::PREFER_HIGH, None, None ; "absent_inherits_no_opt_out")]
+    fn refined_dialect_maps_send_off(
+        declared: &EffortDialect<'static>,
+        send_off: Option<bool>,
+        expected: Option<&str>,
+    ) {
+        let effort = ModelEffort {
+            supported: Vec::new(),
+            send_off,
+        };
+        let model = ladder_model(ThinkingSupport::Yes, None);
+        assert_eq!(
+            ThinkingConfig::Off.effort_str(&effort.refine(declared), &model),
+            expected
+        );
     }
 }

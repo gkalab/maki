@@ -16,7 +16,7 @@ use super::openai_compat;
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::{ResolvedAuth, Timeouts};
-use crate::spec::{AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
+use crate::spec::{AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
 use crate::{
     AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
     ThinkingConfig, dialect,
@@ -50,11 +50,11 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/copilot.toml"),
     pricing_schedule: None,
-    native: Some(Native {
+    build: Build::Native(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: None,
     }),
+    aperture: None,
     login: Some(LoginConfig {
         protocol: Protocol::Openai,
         default_base_url: DEFAULT_API_ENDPOINT,
@@ -423,6 +423,8 @@ impl CopilotModel {
                 .model_picker_category
                 .and_then(CopilotModelCategory::tier),
             provider_info: Some(Arc::new(reasoning)),
+            extra: None,
+            effort: None,
         }
     }
 
@@ -472,8 +474,9 @@ impl CopilotModel {
             return None;
         }
         let usd_per_million = AIC_TO_USD_PER_MILLION / batch_size;
-        let manifest_cache_write =
-            lookup_entry(SPEC.models(), &self.id).map_or(0.0, |entry| entry.pricing.cache_write);
+        let manifest_cache_write = lookup_entry(SPEC.models(), &self.id)
+            .and_then(|entry| entry.pricing.as_ref())
+            .map_or(0.0, |pricing| pricing.cache_write);
         Some(ModelPricing::per_million(
             default.input_price * usd_per_million,
             default.output_price * usd_per_million,

@@ -35,19 +35,21 @@ case("truncate_exceeds_line_limit", function()
   assert(result:find("%[truncated %d+ bytes%]"), "should have truncation marker")
 end)
 
-case("truncate_exceeds_byte_limit", function()
-  local text = string.rep("x", 200)
-  local result = truncate(text, 1000, 50)
-  assert(#result < #text, "should be shorter")
-  assert(result:find("%[truncated"), "should have truncation marker")
+local function truncated(kept, dropped_bytes)
+  return kept .. "\n\n[truncated " .. dropped_bytes .. " bytes]"
+end
+
+case("truncate_single_oversized_line_keeps_prefix", function()
+  eq(truncate(string.rep("x", 200), 1000, 50), truncated(string.rep("x", 50), 150))
 end)
 
-case("truncate_byte_limit_mid_line", function()
-  local text = "short\n" .. string.rep("x", 100)
-  local result = truncate(text, 1000, 20)
-  assert(result:find("short"), "should keep first line")
-  assert(not result:find(string.rep("x", 100)), "should drop long line")
-  assert(result:find("%[truncated"), "should have truncation marker")
+case("truncate_oversized_line_after_kept_lines_is_dropped", function()
+  local text = "short\n" .. string.rep("x", 100) .. "\nlast"
+  eq(truncate(text, 1000, 20), truncated("short", 106))
+end)
+
+case("truncate_oversized_line_cuts_on_utf8_boundary", function()
+  eq(truncate(string.rep("é", 10), 1000, 5), truncated("éé", 16))
 end)
 
 case("truncate_trailing_newlines_counted", function()
@@ -1684,6 +1686,78 @@ case("picker_keys_are_normalized_and_bad_ones_are_dropped", function()
   eq(set["<CR>"], true, "<Enter> matches a <CR> press")
   eq(set["R"], true, "a plain char is itself")
   eq(set["<nope>"], nil, "a key maki cannot name is dropped, not stored to never match")
+end)
+
+local parse = require("maki.provider_parse")
+
+local NUMBERS_JSON = [[{
+  "int": 8192, "whole_float": 8192.0, "exp": 1e3, "frac": 1.5, "neg": -1,
+  "null": null, "str": "8192", "bool": true,
+  "u32_max": 4294967295, "past_u32": 4294967296, "past_u64": 1e20
+}]]
+
+case("provider_parse_as_u64_takes_whole_non_negative_numbers", function()
+  local doc = assert(maki.json.decode(NUMBERS_JSON))
+  for key, expected in pairs({
+    int = 8192,
+    whole_float = 8192,
+    exp = 1000,
+    frac = false,
+    neg = false,
+    null = false,
+    str = false,
+    bool = false,
+    missing = false,
+    past_u32 = 4294967296,
+    past_u64 = false,
+  }) do
+    eq(parse.as_u64(doc[key]), expected or nil, key)
+  end
+end)
+
+case("provider_parse_as_u32_rejects_past_u32_max", function()
+  local doc = assert(maki.json.decode(NUMBERS_JSON))
+  eq(parse.as_u32(doc.u32_max), 4294967295)
+  eq(parse.as_u32(doc.past_u32), nil)
+  eq(parse.as_u32(doc.whole_float), 8192)
+  eq(parse.as_u32(doc.neg), nil)
+end)
+
+case("provider_parse_as_f64_and_as_bool_take_only_their_type", function()
+  local doc = assert(maki.json.decode(NUMBERS_JSON))
+  eq(parse.as_f64(doc.frac), 1.5)
+  eq(parse.as_f64(doc.neg), -1)
+  eq(parse.as_f64(doc.str), nil)
+  eq(parse.as_bool(doc.bool), true)
+  eq(parse.as_bool(false), false, "false is a boolean, not a missing one")
+  eq(parse.as_bool(doc.str), nil)
+end)
+
+case("provider_parse_pricing_needs_both_sides", function()
+  eq(parse.pricing(1e-6, nil), nil, "no output price")
+  eq(parse.pricing(nil, 2e-6), nil, "no input price")
+  local pricing = assert(parse.pricing(1e-6, 2e-6, nil, 5e-7))
+  eq(pricing.input, 1)
+  eq(pricing.output, 2)
+  eq(pricing.cache_write, 0, "a missing cache price")
+  eq(pricing.cache_read, 0.5)
+end)
+
+case("provider_parse_models_keeps_the_first_row_per_id_sorted", function()
+  local body = assert(maki.json.decode([[{"data": [
+    {"id": "b", "n": 1}, {"id": "a"}, {"id": "b", "n": 2}, {"n": 3}, "stray"
+  ]}]]))
+  local rows = parse.models(body, function(raw)
+    if type(raw) == "table" and raw.id then
+      return { id = raw.id, n = raw.n }
+    end
+    return nil
+  end)
+  eq(#rows, 2)
+  eq(rows[1].id, "a")
+  eq(rows[2].id, "b")
+  eq(rows[2].n, 1, "the first b wins")
+  eq(#parse.models({}, function() end), 0, "a body without data")
 end)
 
 th.report()

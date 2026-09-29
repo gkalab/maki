@@ -76,6 +76,10 @@ pub struct AgentHooks<'a> {
 }
 
 impl AgentHooks<'_> {
+    pub fn wraps(&self, slot: AgentSlot) -> bool {
+        self.registry.agent_hook().is_some_and(|h| h.wraps(slot))
+    }
+
     /// `value` is only built when a layer is there to read it. A cancelled or
     /// absent chain answers [`Verdict::Unchanged`], because a layer is an
     /// opinion about the run and never a precondition for it.

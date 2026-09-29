@@ -88,6 +88,10 @@ The rules:
 - A package, or a plugin maki ships, is read the other way round: a key it
   does not name is not requested, so its `plugin.toml` lists everything it
   uses. Only a `plugin.toml` you wrote yourself defaults to granted.
+- `net_hosts` narrows `net = true` to a host allowlist, such as
+  `["api.acme.com", "*.acme.dev"]`. Without it, `net` reaches any public
+  host. A plugin that registers a provider must set it. See
+  [Plugin egress](/docs/permissions/#plugin-egress-net-hosts).
 - `min_maki_version` is optional and takes a plain semantic version as a lower
   bound, so ranges do not work. When the field is invalid or the running
   version is older, Maki skips the Lua in that directory and warns at startup
@@ -121,6 +125,8 @@ The rules:
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
+| [`maki.provider`](#maki-provider) | Providers implemented in Lua. |
+| [`maki.provider.auth`](#maki-provider-auth) | Credential storage for the providers this plugin registered. |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.Timer`](#maki-Timer) | Handle returned by `maki.defer_fn`. |
 | [`maki.task`](#maki-task) | The subagents of the focused session and their transcripts. |
@@ -3141,6 +3147,13 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `tools` (`table?`) map of `name -> function` for tools the sandbox may call.
     Each function receives the tool input table and must return `(string)` or
     `(nil, err)`. Tool calls are batched and dispatched concurrently.
+  - `files` (`table?`) serves text file access from `open()` and `pathlib`.
+    `read(path)` returns `(content)`, `write(path, content, append)` returns
+    `(string)`, and both return `(nil, err)` on failure. Leave one out to
+    refuse that access. Writes wait and go out as one `write` per file right
+    before a tool call, a read of that path, or the end of the run, and a
+    cancelled run drops the ones still waiting. A failed write ends the run,
+    unless a read sent it, then it raises `OSError` just like a failed read.
 
 **Returns:** (`table`, `string?`) Result table, plus an error string on failure.
 
@@ -3666,7 +3679,8 @@ if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
 HTTP client for fetching web content. All traffic goes over HTTPS
 (plain HTTP is upgraded). Private and metadata IP addresses are
 blocked to prevent SSRF, including after a redirect. Hosts listed in
-the `net.allowed_private_hosts` config option are exempt.
+the `net.allowed_private_hosts` config option are exempt, and so is a
+provider plugin's own origin (see `maki.net.request`).
 Failed requests (5xx) are retried automatically.
 
 Requests reuse a pool of clients, so calls to the same host share one
@@ -3690,19 +3704,30 @@ URLs are automatically upgraded to `https://`. Requests to private
 or metadata IP addresses are blocked for safety, unless the host is
 listed in `net.allowed_private_hosts`.
 
+A request to the origin of a provider this plugin registered is sent
+like the provider's chat requests: no address check, no https upgrade,
+maki's user agent, and connect and stall timeouts instead of a total
+one. This holds only for an origin the user set (`<SLUG>_BASE_URL`,
+`providers.toml`) or a built-in provider's default.
+
 {opts} fields:
   `method` (string) HTTP verb (default `"GET"`).
   `headers` (table) Header name/value pairs.
   `body` (string) Request body.
-  `timeout` (integer) Timeout in seconds, max 120 (default 30).
+  `timeout` (integer) Total timeout in seconds, max 120 (default 30,
+    none on a provider's origin).
   `max_bytes` (integer) Max response size in bytes (default 5 MB).
   `retry` (integer) Retries on 5xx errors (default 3).
   `line_match` (string) Regex. Keep only the response lines it
   matches. Filtering happens after the body is read, so `max_bytes`
   still caps the transfer.
 
-The response table has three fields: `body` (string), `status`
-(integer), and `content_type` (string).
+The response table has `body` (string), `status` (integer),
+`content_type` (string) and `headers` (table). `headers` holds the final
+response's headers under lowercase names, as in
+`res.headers["retry-after"]`. Repeated headers are joined with `, `,
+which breaks `set-cookie`. A failed response can go straight to
+`maki.provider.http_error`.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
@@ -3722,6 +3747,286 @@ if err then
 else
   print(res.status, res.body)
 end
+```
+
+
+## maki.provider {#maki-provider}
+
+Providers implemented in Lua.
+
+A registered provider works like a built-in one: its models show up in
+the picker, and its requests get the usual retries, pricing and usage
+accounting. The [Providers guide](/docs/providers/#plugin-providers)
+covers writing one.
+
+```lua
+maki.provider.register({
+  slug = "acme",
+  display_name = "Acme",
+  codec = "openai",
+  base_url = "https://api.acme.com/v1",
+  api_key_env = "ACME_API_KEY",
+  models = { { prefixes = { "acme-large" }, tier = "strong" } },
+})
+```
+
+---
+
+### `maki.provider.register()` {#maki-provider-register}
+
+```lua
+maki.provider.register({spec})
+```
+
+Register a provider this plugin implements. Its models are addressed as
+`<slug>/<model>` and appear in the model picker and in `/model`.
+
+Call it at the top level of the plugin file, since registration only works
+while the plugin loads. The plugin needs a non-empty `net_hosts` list in its
+`plugin.toml`. The [Providers guide](/docs/providers/#plugin-providers)
+walks through a full example.
+
+Set exactly one of `codec` or `base`. An unknown key, or an option the
+chosen codec cannot honour, fails registration.
+
+Every hook is optional and gets a `ctx` table as its first argument:
+  `ctx.slug` (string) The slug the hook serves.
+  `ctx.base_url` (string?) The origin requests go to right now: an origin
+          `auth` returned, then `<SLUG>_BASE_URL` or `providers.toml`,
+          then the declared `base_url`, nil when none is set. Build URLs
+          from it so side calls follow a user who points the slug at a
+          gateway.
+  `ctx.headers` (table) The headers every request to the slug carries.
+  `ctx.get_json(target)` (function) A GET with `ctx.headers`. A `target`
+          starting with `/` is appended to `ctx.base_url`, an absolute URL
+          is used as is. Never retried. Returns the decoded body, or nil
+          plus an error the hook can return as its own.
+
+A hook fails by returning `nil, err`, with `err` from `ctx.get_json` or
+`maki.provider.http_error`. Maki then retries and honours `retry-after` as
+it does for a built-in provider.
+
+{spec} fields:
+  `slug` (string) Required. Letters, digits, `_` and `-`, starting with a
+          letter or digit. Must not be a built-in slug or one defined in
+          `providers.toml`.
+  `display_name` (string) Required. Shown in the UI.
+  `codec` (string) Wire format: `"openai"`, `"openai-responses"`,
+          `"anthropic"` or `"google"`.
+  `base` (string) A native provider to borrow whole, e.g. `"ollama"`.
+          Prefer `codec` for a new provider.
+  `base_url` (string) Default origin. Must be `https`, or `http` on
+          loopback, and its host must match `net_hosts`.
+  `api_key_env` (string) Env var holding the API key, re-read each time
+          the provider is built. Sent as `x-api-key` for anthropic,
+          `x-goog-api-key` for google, and a bearer token otherwise.
+          Needs the `env` permission.
+  `system_prefix` (string) Text prepended to the system prompt. The
+          `google` codec refuses it.
+  `openai` (table) Options for `codec = "openai"`, all optional:
+    `max_tokens_field` (string) Body field carrying the output cap.
+            Defaults to `max_tokens`.
+    `include_stream_usage` (boolean) Ask for usage on the stream.
+            Defaults to `true`.
+    `thinking` (table) How the API spells reasoning effort. Without it,
+            each model's `thinking_fields` decides.
+      `dialect` (string) Required. One of `"standard"`, `"codex"`,
+              `"codex-5-1"`, `"coding-plan"`, `"gpt-5-6"`, `"gpt-6"`,
+              `"prefer-high"`, `"high-only"`, `"glm"`, `"deepseek"`,
+              `"anthropic-adaptive"`, `"tensorx"`, `"grok"` or
+              `"ollama"`.
+      `field` (string) Body path for the effort. Dots nest, e.g.
+              `"reasoning.effort"`. Defaults to `reasoning_effort`.
+      `requires_support` (boolean) Send effort only to models that
+              support thinking. Defaults to `false`.
+    `headers` (table) Sent with every request. A header the credentials
+            set wins. `host`, `content-length`, `transfer-encoding` and
+            `connection` are refused.
+    `extra_body` (table) Merged into every request body.
+    `session_id` (table) Sends the session id, as
+            `{ header = "x-affinity" }` or `{ body_field = "session_id" }`.
+    `thinking_overrides` (table) Model id prefix to `"no"`, `"yes"` or
+            `"required"`, overriding the model table. Longest prefix wins.
+  `models` (table) Static model rows, read once at registration. See
+           [model rows](/docs/providers/#model-rows).
+  `auth` (function) `function(ctx, purpose)` returning
+           `{ base_url = ..., headers = { ... } }`. `purpose` is
+           `"resolve"` before the first request, `"refresh"` after a 401,
+           or `"reload"` after a login changed the stored credentials.
+           Omitting `base_url` keeps the current one.
+  `list_models` (function) `function(ctx)` returning model rows for a
+           catalogue only known at runtime. Rows carry `id`,
+           `context_window`, `max_output_tokens`, `pricing`,
+           `supports_thinking`, `supports_vision` and `tier`, plus two
+           optional fields. `extra` is any JSON value, handed back to
+           `build_body` as `opts.model_info`. `effort` narrows the
+           `openai.thinking` dialect for this model: `supported` lists the
+           effort names the provider accepts, and `send_off` is `true` to
+           send `"none"` for off or `false` to send nothing.
+  `build_body` (function) `function(ctx, body, model, opts)` returning
+           the body to send. `opts.thinking` is the rendered effort level,
+           nil when thinking is off. `openai` codecs only.
+  `map_error` (function) `function(ctx, status, message)` returning
+           `{ status = ..., message = ... }`, or nil to keep the error.
+           Retryability follows the returned status.
+  `fetch_usage` (function) `function(ctx)` returning
+           `{ plan = ..., limits = { { label = ..., percentage = ...,
+           reset_at = ..., detail = ... } }, by_model_today = { { model = ...,
+           input_tokens = ..., output_tokens = ..., total_tokens = ...,
+           spend_microdollars = ... } } }` or nil. Only `label` is
+           required in a limit, and `by_model_today` is optional.
+  `login` (function) `function(ctx)`. Defining it lists the provider in
+           `maki auth login`. This `ctx` also has `ctx.print(text)`,
+           `ctx.prompt({ label = ..., secret = ... })` and
+           `ctx.open_url(url)`.
+  `logout` (function) `function(ctx)`, run by `maki auth logout`.
+
+Requires the `net` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{spec}` (`table`) Provider specification (see above).
+
+**Example:**
+
+```lua
+maki.provider.register({
+  slug = "acme",
+  display_name = "Acme",
+  codec = "openai",
+  base_url = "https://api.acme.com/v1",
+  models = {
+    { prefixes = { "acme-large" }, tier = "strong", context_window = 200000 },
+  },
+  auth = function(ctx)
+    local creds = maki.provider.auth.get(ctx.slug) or {}
+    return { headers = { Authorization = "Bearer " .. (creds.token or "") } }
+  end,
+})
+```
+
+---
+
+### `maki.provider.http_error()` {#maki-provider-http_error}
+
+```lua
+maki.provider.http_error({res})
+```
+
+Turn a failed `maki.net.request` response into a provider error. A hook
+returns it as `return nil, err`, and Maki handles it like a built-in
+provider's failure: a 429 or 5xx is retried and `retry-after` sets the
+wait. A hook that raises instead fails as a broken hook.
+
+{res} fields:
+  `status` (integer) Required. The HTTP status.
+  `body` (string) Required. Becomes the error message.
+  `headers` (table) Only `retry-after` is read, case-insensitively.
+
+**Parameters:**
+
+- `{res}` (`table`) A response from `maki.net.request`.
+
+**Returns:** (`userdata`) A `ProviderError`. Opaque, but `tostring` renders it.
+
+**Example:**
+
+```lua
+fetch_usage = function(ctx)
+  local res = assert(maki.net.request(ctx.base_url .. "/usage", { headers = ctx.headers }))
+  if res.status ~= 200 then
+    return nil, maki.provider.http_error(res)
+  end
+  return { limits = {} }
+end
+```
+
+
+## maki.provider.auth {#maki-provider-auth}
+
+Credential storage for the providers this plugin registered.
+
+Each slug gets one JSON file at
+`~/.local/state/maki/auth/plugins/<slug>.json`, with mode 0600, atomic
+writes and a lock against other Maki processes. The plugin decides what
+goes in it. A plugin can only reach slugs it registered itself.
+
+```lua
+maki.provider.auth.set("acme", { access_token = tok, expires = when })
+local creds = maki.provider.auth.get("acme")
+maki.provider.auth.clear("acme")
+```
+
+---
+
+### `maki.provider.auth.get()` {#maki-provider-auth-get}
+
+```lua
+maki.provider.auth.get({slug})
+```
+
+Read the credentials this plugin stored for one of its providers. Returns
+nil when nothing was stored yet, for example before the first login.
+
+**Parameters:**
+
+- `{slug}` (`string`) A provider slug this plugin registered.
+
+**Returns:** (`table?`, `string?`) The stored credentials, or nil plus an error.
+
+**Example:**
+
+```lua
+local creds = maki.provider.auth.get("acme")
+if creds then print(creds.access_token) end
+```
+
+---
+
+### `maki.provider.auth.set()` {#maki-provider-auth-set}
+
+```lua
+maki.provider.auth.set({slug}, {credentials})
+```
+
+Store credentials for one of this plugin's providers, replacing what was
+there. Any table with string keys works, such as a token plus its expiry.
+An `auth` hook can call it to save a refreshed token.
+
+**Parameters:**
+
+- `{slug}` (`string`) A provider slug this plugin registered.
+- `{credentials}` (`table`) Any table with string keys.
+
+**Returns:** (`boolean?`, `string?`) True, or nil plus an error string.
+
+**Example:**
+
+```lua
+local ok, err = maki.provider.auth.set("acme", { access_token = token })
+if not ok then maki.log.error(err) end
+```
+
+---
+
+### `maki.provider.auth.clear()` {#maki-provider-auth-clear}
+
+```lua
+maki.provider.auth.clear({slug})
+```
+
+Forget the credentials stored for one of this plugin's providers.
+
+**Parameters:**
+
+- `{slug}` (`string`) A provider slug this plugin registered.
+
+**Returns:** (`boolean?`, `string?`) True, or nil plus an error string.
+
+**Example:**
+
+```lua
+maki.provider.auth.clear("acme")
 ```
 
 
@@ -6656,6 +6961,38 @@ function M.tail(text, n)
 function M.cut(view, out, reason, timeout_secs)
 ```
 
+### `require("maki.provider_parse")`
+
+```lua
+-- Typed readers for provider model-list and usage JSON, for use in
+-- `list_models` and `fetch_usage` hooks.
+--
+-- `8192` and `8192.0` both count as whole numbers. A JSON null decodes to nil,
+-- and in an array it stops `ipairs`. Numbers above 2^53 come back rounded.
+
+--- A whole, non-negative number up to 2^64, or nil.
+function M.as_u64(value)
+
+--- A whole, non-negative number that fits a u32, or nil.
+function M.as_u32(value)
+
+--- A number, or nil.
+function M.as_f64(value)
+
+--- A boolean, or nil.
+function M.as_bool(value)
+
+--- A model row's `pricing`, converted from per-token to per-million-token
+--- dollars. Nil unless both `input` and `output` are given, so a partial price
+--- never reads as free. A missing cache price is 0.
+function M.pricing(input, output, cache_write, cache_read)
+
+--- Maps each `body.data` element through `parse_row`, drops nils, keeps the
+--- first row per id, and sorts by id. Returns an empty list when `data` is
+--- not an array.
+function M.models(body, parse_row)
+```
+
 ### `require("maki.scroll")`
 
 ```lua
@@ -6871,6 +7208,14 @@ local function truncate(text, max_lines, max_bytes)
     end
     local new_bytes = bytes + #line + 1
     if new_bytes > max_bytes then
+      if #out == 0 then
+        -- Back off UTF-8 continuation bytes so no character is split in half.
+        local cut = max_bytes
+        while cut > 0 and line:find("^[\128-\191]", cut + 1) do
+          cut = cut - 1
+        end
+        out[1] = line:sub(1, cut)
+      end
       break
     end
     out[#out + 1] = line

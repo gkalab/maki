@@ -11,6 +11,10 @@ local partial = require("maki.partial")
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local MAX_SCRIPT_LINES = 2000
+local OPEN_READ_CHECK_LINES = 1
+local READ_INPUT_SLOTS = { "tool.read.input", "tool.*.input" }
+local OPEN_READ_HOOKED_ERR = "open() cannot read while a plugin hooks the read tool, call read() instead"
+local OPEN_APPEND_UNSUPPORTED_ERR = "open() cannot append because the write tool has no append option"
 local NO_OUTPUT = "(no output)"
 local SEPARATOR = "──────"
 local CANCELLED_ERR = "cancelled"
@@ -125,7 +129,7 @@ Use for chained/dependent tool calls and filtering/processing results, e.g. filt
 
 - All tools are async and return strings: `result = await read(path='file.txt', offset=1, limit=0)`. Parse output yourself.
 - Concurrency: `a, b = await gather(read(path='a.py', offset=1, limit=0), grep(pattern='x'))`. Pass calls directly, never wrapped in `async def`.
-- Available libs: re, asyncio, sys, os, json. No other imports, no classes, no filesystem/network access.
+- Available libs: re, asyncio, sys, os, json. No other imports, no classes, no network access. `open()` works on text files.
 - Fresh sandbox each run: no state persists between executions.
 - 30s script timeout (`timeout` param); time awaiting tool calls doesn't count.
 - Skip it when a single tool call needs no transformation.
@@ -266,6 +270,43 @@ local function start(input, ctx)
   highlight()
 end
 
+-- `open()` rides on the read and write tools, so hooks, plugins that replace
+-- them, permission prompts, the file lock and plan mode all still apply. The
+-- read tool numbers and caps lines, so we ask it for one line just to get its
+-- yes and record the read, then take the real content straight from disk.
+-- A read hook may have pointed that check at another file, so while one is
+-- installed we refuse rather than read the path it steered away from.
+-- A replacement write tool without `append` would drop the flag and overwrite
+-- the file, so appends are refused there.
+local function file_access(tools, schemas)
+  local files = {}
+  if tools.read then
+    files.read = function(path)
+      local slots = maki.api.get_slots()
+      for _, name in ipairs(READ_INPUT_SLOTS) do
+        if slots[name] and #slots[name].fillers > 0 then
+          return nil, OPEN_READ_HOOKED_ERR
+        end
+      end
+      local _, err = tools.read({ path = path, offset = 1, limit = OPEN_READ_CHECK_LINES })
+      if err then
+        return nil, err
+      end
+      return maki.fs.read(maki.fs.abspath(path))
+    end
+  end
+  if tools.write then
+    local can_append = (schemas.write.properties or {}).append ~= nil
+    files.write = function(path, content, append)
+      if append and not can_append then
+        return nil, OPEN_APPEND_UNSUPPORTED_ERR
+      end
+      return tools.write({ path = path, content = content, append = append })
+    end
+  end
+  return files
+end
+
 local function handler(input, ctx)
   local timeout = input.timeout or opts.timeout_secs
 
@@ -311,10 +352,11 @@ local function handler(input, ctx)
     return { llm_output = CALLABLE_TOOLS_ERR .. callable_err, is_error = true }
   end
 
-  local tools = {}
+  local tools, schemas = {}, {}
   for _, t in ipairs(interpreter_tools(callable, ctx:audience(), ctx:workflow())) do
     local bind, name = t.alias or t.name, t.name
     if bind:match(PY_IDENTIFIER) then
+      schemas[bind] = t.schema or {}
       tools[bind] = function(tool_input)
         if t.workflow_only then
           return maki.agent.call_tool(ctx, name, tool_input, {})
@@ -334,6 +376,7 @@ local function handler(input, ctx)
     preamble = PREAMBLE,
     on_output = show,
     tools = tools,
+    files = file_access(tools, schemas),
   })
 
   if err then

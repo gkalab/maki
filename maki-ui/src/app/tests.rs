@@ -4363,6 +4363,7 @@ fn mcp_toggle_dispatches_action() {
                 config_path: PathBuf::from("/tmp/config.toml"),
                 url: None,
                 oauth: None,
+                ca_file: None,
             }],
             prompts: vec![],
             pids: vec![],

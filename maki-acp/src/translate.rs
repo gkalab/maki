@@ -146,6 +146,8 @@ pub fn permission_update(
 
 /// `write` replaces the whole file, so its input is the new text and disk still
 /// holds the old one: the write lock is only taken once permission is granted.
+/// With `append` the input is only the tail, so the new text is old plus tail,
+/// or the user would approve what looks like wiping the file.
 /// `edit` gets no diff on purpose, applying its old_string/new_string here
 /// would be a second copy of the plugin's logic, free to drift.
 fn write_diff(
@@ -157,7 +159,8 @@ fn write_diff(
     if tool != WRITE_TOOL {
         return None;
     }
-    let new_text = raw_input.get("content")?.as_str()?;
+    let content = raw_input.get("content")?.as_str()?;
+    let append = raw_input.get("append").and_then(serde_json::Value::as_bool) == Some(true);
     let path = resolve_path(input_path(raw_input)?, cwd, home)?;
 
     let old_text = match fs::metadata(&path) {
@@ -168,7 +171,11 @@ fn write_diff(
         Ok(_) => fs::read_to_string(&path).ok(),
         Err(_) => None,
     };
-    Some(Diff::new(path, new_text.to_string()).old_text(old_text))
+    let new_text = match (&old_text, append) {
+        (Some(old), true) => format!("{old}{content}"),
+        _ => content.to_string(),
+    };
+    Some(Diff::new(path, new_text).old_text(old_text))
 }
 
 /// File locations the tool call touches, per ACP "Following the Agent". The
@@ -926,6 +933,22 @@ mod tests {
         assert_eq!(json["content"][0]["path"], path.to_str().unwrap());
         assert_eq!(json["content"][0]["newText"], NEW_TEXT);
         assert_eq!(json["content"][0]["oldText"], json!(expected_old));
+    }
+
+    #[test]
+    fn append_permission_diffs_old_text_plus_the_tail() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(REL_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, OLD_TEXT).unwrap();
+
+        let input = json!({"path": REL_PATH, "content": NEW_TEXT, "append": true});
+        let json = permission_json(WRITE_TOOL, Some(&input), dir.path());
+        assert_eq!(json["content"][0]["oldText"], OLD_TEXT);
+        assert_eq!(
+            json["content"][0]["newText"],
+            format!("{OLD_TEXT}{NEW_TEXT}")
+        );
     }
 
     #[test]

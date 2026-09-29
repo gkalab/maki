@@ -540,6 +540,7 @@ fn injected_servers(servers: &[McpServer]) -> Vec<(String, RawTransport)> {
                     url: http.url.clone(),
                     headers: pairs(&http.headers, |h| (&h.name, &h.value)),
                     oauth: None,
+                    ca_file: None,
                 }),
             )),
             McpServer::Stdio(stdio) => Some((

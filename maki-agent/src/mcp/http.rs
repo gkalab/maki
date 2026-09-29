@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -6,7 +7,7 @@ use std::time::{Duration, Instant};
 use async_lock::Mutex;
 use futures_lite::AsyncReadExt;
 use isahc::HttpClient;
-use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
+use isahc::config::{CaCertificate, Configurable, RedirectPolicy, VersionNegotiation};
 use isahc::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use isahc::http::{Method, Request, StatusCode, header::HeaderMap};
 use maki_storage::StateDir;
@@ -19,7 +20,7 @@ use super::protocol::{JsonRpcError, JsonRpcNotification, JsonRpcRequest};
 use super::transport::{BoxFuture, McpTransport};
 use tracing::{info, warn};
 
-pub(super) const MAX_REDIRECTS: u32 = 10;
+const MAX_REDIRECTS: u32 = 10;
 const SESSION_HEADER: &str = "mcp-session-id";
 const PROTOCOL_HEADER: &str = "mcp-protocol-version";
 const INITIALIZE_METHOD: &str = "initialize";
@@ -35,6 +36,7 @@ pub struct HttpTransport {
     headers: HashMap<String, String>,
     auth: Mutex<Option<String>>,
     storage: Option<StateDir>,
+    ca_file: Option<PathBuf>,
     negotiated: Mutex<Negotiated>,
     next_id: AtomicU64,
 }
@@ -47,6 +49,32 @@ struct Negotiated {
     protocol_version: Option<String>,
 }
 
+/// The transport and OAuth both build their client here, so they reach a server the same way.
+///
+/// We check `ca_file` here and not while parsing the config, so a disabled server with a
+/// missing bundle still shows as disabled. Without the check, a missing file would only
+/// show up on the first request, as a confusing TLS error.
+pub(super) fn build_client(
+    timeout: Duration,
+    ca_file: Option<&Path>,
+) -> Result<HttpClient, String> {
+    let builder = HttpClient::builder()
+        .redirect_policy(RedirectPolicy::Limit(MAX_REDIRECTS))
+        // The workspace enables curl's http2 feature for OTLP over gRPC,
+        // which would otherwise flip this transport to h2 over TLS. Its
+        // streaming responses are tuned for HTTP/1.1, so pin it.
+        .version_negotiation(VersionNegotiation::http11())
+        .timeout(timeout);
+    let builder = match ca_file {
+        Some(path) if !path.is_file() => {
+            return Err(format!("ca_file '{}' is not a file", path.display()));
+        }
+        Some(path) => builder.ssl_ca_certificate(CaCertificate::file(path)),
+        None => builder,
+    };
+    builder.build().map_err(|e| e.to_string())
+}
+
 impl HttpTransport {
     pub fn new(
         name: &str,
@@ -54,19 +82,12 @@ impl HttpTransport {
         headers: &HashMap<String, String>,
         timeout: Duration,
         storage: Option<StateDir>,
+        ca_file: Option<&Path>,
     ) -> Result<Self, McpError> {
-        let client = HttpClient::builder()
-            .redirect_policy(RedirectPolicy::Limit(MAX_REDIRECTS))
-            // The workspace enables curl's http2 feature for OTLP over gRPC,
-            // which would otherwise flip this transport to h2 over TLS. Its
-            // streaming responses are tuned for HTTP/1.1, so pin it.
-            .version_negotiation(VersionNegotiation::http11())
-            .timeout(timeout)
-            .build()
-            .map_err(|e: isahc::Error| McpError::StartFailed {
-                server: name.into(),
-                reason: e.to_string(),
-            })?;
+        let client = build_client(timeout, ca_file).map_err(|reason| McpError::StartFailed {
+            server: name.into(),
+            reason,
+        })?;
 
         let mut headers = headers.clone();
         let auth = headers
@@ -86,6 +107,7 @@ impl HttpTransport {
             headers,
             auth: Mutex::new(auth),
             storage,
+            ca_file: ca_file.map(Path::to_path_buf),
             negotiated: Mutex::new(Negotiated::default()),
             next_id: AtomicU64::new(1),
         })
@@ -193,7 +215,7 @@ impl HttpTransport {
             return guard.clone();
         }
 
-        match oauth::silent_refresh(storage, &self.name, &self.url).await {
+        match oauth::silent_refresh(storage, &self.name, &self.url, self.ca_file.as_deref()).await {
             Ok(Some(data)) => {
                 let header = format!("Bearer {}", data.tokens?.access);
                 *guard = Some(header.clone());
@@ -525,9 +547,15 @@ mod tests {
             }
         });
 
-        let transport =
-            HttpTransport::new("srv", &url, &HashMap::new(), PENDING_REQUEST_TIMEOUT, None)
-                .unwrap();
+        let transport = HttpTransport::new(
+            "srv",
+            &url,
+            &HashMap::new(),
+            PENDING_REQUEST_TIMEOUT,
+            None,
+            None,
+        )
+        .unwrap();
         smol::block_on(async {
             let pending: BoxFuture<'_, ()> = match operation {
                 PendingOperation::Request => Box::pin(async {
@@ -663,7 +691,28 @@ mod tests {
         headers: HashMap<String, String>,
         storage: Option<StateDir>,
     ) -> HttpTransport {
-        HttpTransport::new("srv", url, &headers, TRANSPORT_TIMEOUT, storage).unwrap()
+        HttpTransport::new("srv", url, &headers, TRANSPORT_TIMEOUT, storage, None).unwrap()
+    }
+
+    #[test_case("missing.pem" ; "missing_file")]
+    #[test_case(""            ; "directory")]
+    fn ca_file_that_is_not_a_file_fails_the_start(file_name: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_file = dir.path().join(file_name);
+        let Err(McpError::StartFailed { reason, .. }) = HttpTransport::new(
+            "srv",
+            "http://127.0.0.1:1/mcp",
+            &HashMap::new(),
+            TRANSPORT_TIMEOUT,
+            None,
+            Some(&ca_file),
+        ) else {
+            panic!("expected StartFailed");
+        };
+        assert!(
+            reason.contains(&ca_file.display().to_string()),
+            "got: {reason}"
+        );
     }
 
     fn oauth_routes(base: &str, req: &Req) -> Option<(u16, String)> {

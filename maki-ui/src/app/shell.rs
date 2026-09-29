@@ -12,7 +12,7 @@ use futures_lite::io::{AsyncBufReadExt, BufReader};
 use maki_agent::{
     AgentConfig, CancelToken, CancelTrigger, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
 };
-use maki_providers::Message;
+use maki_providers::{Message, strip_provider_keys};
 
 use super::App;
 
@@ -215,7 +215,7 @@ async fn run_command(
     max_output_bytes: usize,
 ) -> Result<String, String> {
     let mut std_cmd = StdCommand::new("bash");
-    std_cmd
+    strip_provider_keys(&mut std_cmd)
         .arg("-c")
         .arg(command)
         .env("GIT_TERMINAL_PROMPT", "0");

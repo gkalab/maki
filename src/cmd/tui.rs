@@ -18,6 +18,7 @@ use maki_storage::StateDir;
 use maki_ui::{OpenSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
+use crate::provider_scripts;
 use crate::resume::{self, Resolved};
 use crate::setup;
 
@@ -177,11 +178,15 @@ fn build_stack(
         },
     )?;
 
+    warnings.extend(provider_scripts::startup_warning());
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
     let (model, needs_login) = match (model_result, fallback_model) {
-        (Ok(m), _) => (m, false),
+        (Ok((m, warning)), _) => {
+            warnings.extend(warning);
+            (m, false)
+        }
         (Err(e), Some(last_model)) => {
             warnings.push(format!("{MODEL_FALLBACK_WARNING}: {e:#}"));
             (last_model, false)

@@ -24,6 +24,7 @@ use mlua::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use termina::{PlatformTerminal, Terminal as _};
 
 use crate::api::net::{self, NetError, ResponseData};
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_to_json_within};
@@ -556,11 +557,15 @@ fn read_answer(label: &str, secret: bool) -> Pair<String> {
             Err(e) => (None, Some(e.to_string())),
         };
     }
-    if let Err(e) = crossterm::terminal::enable_raw_mode() {
+    let mut control = match PlatformTerminal::new() {
+        Ok(control) => control,
+        Err(e) => return (None, Some(e.to_string())),
+    };
+    if let Err(e) = control.enter_raw_mode() {
         return (None, Some(e.to_string()));
     }
     let answer = read_masked();
-    let _ = crossterm::terminal::disable_raw_mode();
+    control.enter_cooked_mode().ok();
     println!();
     answer
 }

@@ -47,9 +47,8 @@ impl App {
     }
 
     /// Whether a plugin writing to the chat input would land in a box the
-    /// user can see: nothing covering it, the main chat in front, no form in
-    /// the bottom panel, and a {area} tall enough to leave the box a text
-    /// row. An overlay counts even when it only takes the keyboard, because
+    /// user can see: nothing covering it, no form in the bottom panel, and a
+    /// {area} tall enough to leave the box a text row. An overlay counts even when it only takes the keyboard, because
     /// the user is reading it and not the draft.
     ///
     /// Worked out from state on every ask rather than recorded while
@@ -57,7 +56,7 @@ impl App {
     /// permission prompt and a plugin's edit can arrive in the same one and
     /// the edit has to meet the prompt that is already open.
     pub(crate) fn input_live(&self, area: Rect) -> bool {
-        self.is_main_chat()
+        self.chat_accepts_input()
             && !self.any_overlay_open()
             && !self.plan_form_active()
             && self.compute_layout(area).input_area.height > BORDER_ROWS
@@ -117,9 +116,9 @@ impl App {
             0
         } else if self.form_visible() {
             self.plan_form.height(max_bottom).min(max_bottom)
-        } else if self.is_main_chat() {
+        } else if self.chat_accepts_input() {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
-            queue_panel::height(self.queue.panel_len())
+            queue_panel::height(self.active_queue_len())
                 + panel_h
                 + self.input_box.height(inner.width).min(max_bottom)
         } else {
@@ -141,7 +140,7 @@ impl App {
         let queue_height = if bottom_takeover {
             0
         } else {
-            queue_panel::height(self.queue.panel_len())
+            queue_panel::height(self.active_queue_len())
         };
 
         let mut constraints = vec![Constraint::Length(queue_height)];
@@ -190,39 +189,33 @@ impl App {
     }
 
     /// Returns the cell the input box drew its caret in, when it drew one at
-    /// all: a prompt, a form, a `below` split or a focused subagent chat all
-    /// take the box off screen, and a box scrolled off its own viewport draws
-    /// without a caret.
+    /// all: a prompt, a form, a `below` split or a finished subagent's chat
+    /// all take the box off screen, and a box scrolled off its own viewport
+    /// draws without a caret. A running subagent's chat keeps the box, so a
+    /// message can be queued for that subagent while watching it.
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Option<Position> {
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
         } else if self.pack_review.is_open() {
             self.pack_review.view(frame, layout.bottom_area);
-        } else if !self.is_main_chat() {
+        } else if !self.chat_accepts_input() {
             let panel_reqs = self.float_mgr.panel_reqs();
             let panel_h: u16 = panel_reqs.iter().map(|(_, h)| *h).sum();
-            let (panel_areas, sep_area) = if panel_h > 0 {
-                let [panels, s] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
+            let sep_area = if panel_h > 0 {
+                let [panels, sep] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)])
                     .areas(layout.bottom_area);
                 let constraints: Vec<_> = panel_reqs
                     .iter()
                     .map(|&(_, h)| Constraint::Length(h))
                     .collect();
-                let sub = Layout::vertical(constraints).split(panels);
-                let areas: Vec<(usize, Rect)> = panel_reqs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &(idx, _))| (idx, sub[i]))
-                    .collect();
-                (Some(areas), s)
-            } else {
-                (None, layout.bottom_area)
-            };
-            if let Some(areas) = panel_areas {
-                for (idx, rect) in areas {
-                    self.float_mgr.view_panel(frame, idx, rect);
+                let areas = Layout::vertical(constraints).split(panels);
+                for (i, &(idx, _)) in panel_reqs.iter().enumerate() {
+                    self.float_mgr.view_panel(frame, idx, areas[i]);
                 }
-            }
+                sep
+            } else {
+                layout.bottom_area
+            };
             let sep = Block::default()
                 .borders(Borders::TOP)
                 .border_style(self.separator_style());
@@ -230,12 +223,15 @@ impl App {
         } else if self.plan_form_active() {
             self.plan_form.view(frame, layout.bottom_area);
         } else if layout.bottom_area.height > 0 {
-            let queue_entries = self.queue.panel_entries();
-            queue_panel::view(frame, layout.queue_area, &queue_entries, self.queue.focus());
+            let queue_entries = self.active_queue_entries();
+            let focus = self.queue.focus().filter(|_| self.is_main_chat());
+            queue_panel::view(frame, layout.queue_area, &queue_entries, focus);
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            let placeholder = if self.status == Status::Streaming {
+            let placeholder = if !self.is_main_chat() {
+                Placeholder::SubagentQueue
+            } else if self.status == Status::Streaming {
                 Placeholder::Queue
             } else if self.state.session.messages().is_empty() {
                 Placeholder::Suggestion
@@ -383,7 +379,7 @@ impl App {
             zone: SelectionZone::Messages,
         });
 
-        if layout.input_area.height > 0 && !layout.bottom_takeover && self.is_main_chat() {
+        if layout.input_area.height > 0 && !layout.bottom_takeover && self.chat_accepts_input() {
             let input_inner = Rect::new(
                 layout.input_area.x,
                 layout.input_area.y + 1,
@@ -398,16 +394,12 @@ impl App {
 
         self.zones.push_overlay(layout.status_area);
 
-        if self.form_visible() {
+        if self.form_visible() || !self.chat_accepts_input() {
             self.zones.push_overlay(layout.bottom_area);
         }
 
         for &(_, rect) in &layout.panel_windows {
             self.zones.push_overlay(selection::inset_border(rect));
-        }
-
-        if !self.is_main_chat() && layout.bottom_area.height > 0 {
-            self.zones.push_overlay(layout.bottom_area);
         }
 
         if layout.queue_area.height > 0 && !layout.bottom_takeover {

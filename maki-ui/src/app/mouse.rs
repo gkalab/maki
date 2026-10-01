@@ -71,7 +71,7 @@ impl App {
     pub(super) fn insert_pasted(&mut self, text: String) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let mut any_image = false;
-        if self.is_main_chat() {
+        if self.chat_accepts_input() {
             for line in text.lines() {
                 if let Some((path, media_type)) = image::try_parse_image_path(line) {
                     self.start_file_image_paste(path, media_type);

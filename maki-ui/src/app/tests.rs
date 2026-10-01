@@ -1,7 +1,7 @@
 use super::*;
 use crate::AppSession;
 use crate::agent::shared_queue;
-use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
+use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
@@ -16,8 +16,8 @@ use arc_swap::ArcSwap;
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
     AgentMode, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
-    McpSnapshot, McpSnapshotReader, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent,
+    McpSnapshot, McpSnapshotReader, SharedBuf, SubagentInbox, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -303,6 +303,7 @@ fn subagent_info_with_tx(
         model: None,
         opts: None,
         answer_tx,
+        inbox: None,
     }
 }
 
@@ -6582,6 +6583,149 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     assert!(!app.chats[0].is_finished());
 }
 
+/// A subagent whose session handed the UI its inbox, the way `sess:prompt`
+/// does through `SubagentInfo`, with that chat in front.
+fn app_with_subagent_inbox() -> (App, Arc<SubagentInbox>) {
+    let inbox = Arc::new(SubagentInbox::default());
+    let mut app = streaming_app();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.inbox = Some(Arc::clone(&inbox));
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "x".into() },
+        subagent: Some(info),
+        run_id: 1,
+    })));
+    app.run_builtin(BuiltinAction::NextChat);
+    assert_eq!(app.active_chat, 1);
+    (app, inbox)
+}
+
+/// A message typed in a running subagent's chat is for that subagent: it
+/// waits in its inbox, shows in that chat's queue panel, and leaves the
+/// session queue and the main chat alone.
+#[test]
+fn submit_in_subagent_chat_queues_for_that_subagent() {
+    let (mut app, inbox) = app_with_subagent_inbox();
+    let main_messages = app.chats[0].message_count();
+    let actions = type_and_submit(&mut app, "q");
+    assert!(actions.is_empty());
+    assert_eq!(inbox.texts(), ["q"]);
+    assert!(app.queue.is_empty());
+    assert_eq!(app.active_queue_entries()[0].text, "q");
+    assert_eq!(
+        app.active_chat, 1,
+        "queueing keeps the subagent chat in front"
+    );
+    assert_eq!(app.chats[0].message_count(), main_messages);
+    assert!(app.input_box.is_empty());
+}
+
+/// The subagent's loop reports the pickup like the main one does, and the
+/// bubble lands in the chat the message was typed in.
+#[test]
+fn inbox_consumed_draws_in_subagent_chat() {
+    let (mut app, _inbox) = app_with_subagent_inbox();
+    let main_messages = app.chats[0].message_count();
+    app.update(subagent_msg(
+        AgentEvent::QueueItemConsumed {
+            text: "q".into(),
+            images: Vec::new(),
+        },
+        TASK_ID,
+        None,
+    ));
+    assert_eq!(app.chats[1].last_message_text(), "q");
+    assert_eq!(app.chats[1].last_message_role(), Some(&DisplayRole::User));
+    assert_eq!(app.chats[0].message_count(), main_messages);
+}
+
+#[test]
+fn submit_in_subagent_chat_without_inbox_flashes() {
+    let mut app = app_with_active_subagent();
+    let actions = type_and_submit(&mut app, "q");
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text().unwrap(), queue::NO_INBOX_ERR);
+    assert!(app.queue.is_empty());
+}
+
+#[test]
+fn pop_queue_in_subagent_chat_drops_its_inbox_head() {
+    let (mut app, inbox) = app_with_subagent_inbox();
+    type_and_submit(&mut app, "a");
+    type_and_submit(&mut app, "b");
+    app.update(Msg::Key(kb::POP_QUEUE.to_key_event()));
+    assert_eq!(inbox.texts(), ["b"]);
+}
+
+/// Nothing drains the inbox once the subagent is gone, so what was left in it
+/// is reported in the transcript rather than lost in silence.
+#[test]
+fn finished_subagent_reports_undelivered_messages() {
+    let (mut app, inbox) = app_with_subagent_inbox();
+    type_and_submit(&mut app, "a");
+    finish_subagent_task(&mut app, false);
+    assert!(app.chats[1].inbox.is_none());
+    assert_eq!(inbox.len(), 1);
+    let notice = app.chats[1]
+        .message_at(app.chats[1].message_count() - 2)
+        .unwrap();
+    assert_eq!(notice.text, format!("1{INBOX_DROPPED_SUFFIX}"));
+    assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+}
+
+/// A finished subagent's chat is a transcript: no box to type into, and a
+/// draft typed elsewhere is left alone.
+#[test]
+fn finished_subagent_chat_takes_no_prompt() {
+    let mut app = app_with_active_subagent();
+    finish_subagent_task(&mut app, false);
+    app.update(Msg::Key(key(KeyCode::Char('q'))));
+    app.update(Msg::Paste("hi".into()));
+    assert!(app.input_box.is_empty());
+    assert!(!app.input_live(Rect::new(0, 0, 80, 24)));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(actions.is_empty());
+    assert!(app.queue.is_empty());
+}
+
+#[test]
+fn paste_in_subagent_chat_lands_in_input() {
+    let mut app = app_with_active_subagent();
+    app.update(Msg::Paste("hi".into()));
+    assert_eq!(app.input_box.buffer.value(), "hi");
+}
+
+#[test]
+fn draft_stays_with_the_chat_it_was_typed_in() {
+    let (mut app, inbox) = app_with_subagent_inbox();
+    app.run_builtin(BuiltinAction::PrevChat);
+    app.update(Msg::Paste("for main".into()));
+
+    app.run_builtin(BuiltinAction::NextChat);
+    assert!(app.input_box.is_empty());
+    app.update(Msg::Paste("for sub".into()));
+
+    app.run_builtin(BuiltinAction::PrevChat);
+    assert_eq!(app.input_box.buffer.value(), "for main");
+
+    app.focus_task(TASK_ID).unwrap();
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(inbox.texts(), ["for sub"]);
+    assert!(app.queue.is_empty());
+}
+
+#[test]
+fn ctrl_c_in_subagent_chat_discards_draft_before_cancelling() {
+    let mut app = app_with_active_subagent();
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(actions.is_empty());
+    assert!(app.input_box.is_empty());
+
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(matches!(&actions[0], Action::CancelAgent { .. }));
+}
+
 // -- Every frame checkpoints: one way in for a history, one trigger to save --
 
 /// Long enough that a waiting change is still waiting when the assert runs, on
@@ -6758,11 +6902,7 @@ fn tool_use_msg(id: &str) -> Message {
 fn tool_result_msg(id: &str, text: &str) -> Message {
     Message {
         role: Role::User,
-        content: vec![ContentBlock::ToolResult {
-            tool_use_id: id.into(),
-            content: text.into(),
-            is_error: false,
-        }],
+        content: vec![ContentBlock::tool_result(id, text, false)],
         display_text: Some(String::new()),
         ..Default::default()
     }

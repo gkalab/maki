@@ -99,6 +99,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Weak | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
 | Medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
 | Medium | gpt-6-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
+| Medium | gpt-6.1-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | Medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 | Medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
 | Medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
@@ -424,6 +425,7 @@ supports_vision = false
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
 | `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
 | `subsidised_by` | string | Name of the flat subscription prepaying this provider (e.g. `"Max"`). Models bill $0 and show the published list price beside it as a reference. The list-price fallback needs `protocol = "anthropic"` |
+| `supports_deferred_tools` | bool | The endpoint can load a deferred MCP tool without rewriting the cached tools prefix (see [MCP](../mcp/#loads-and-the-prompt-cache)). True for Anthropic direct and Bedrock. A custom `protocol = "anthropic"` provider defaults to false and opts in here. Set it to false on a built-in pointed at a gateway without this support |
 | `models` | array | Declared models for custom providers (see below) |
 | `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
 

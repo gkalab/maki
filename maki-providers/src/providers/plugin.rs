@@ -310,9 +310,9 @@ fn honours_openai_wire(target: Target) -> bool {
 /// spec behind the target, because `codec = "google"` and `base = "google"`
 /// reach the same constructor and must answer alike.
 fn honours_system_prefix(target: Target) -> bool {
-    !target
+    target
         .spec()
-        .is_some_and(|spec| spec.slug == super::google::SLUG)
+        .is_none_or(|spec| spec.slug != super::google::SLUG)
 }
 
 pub fn is_valid_slug(s: &str) -> bool {

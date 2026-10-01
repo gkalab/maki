@@ -38,9 +38,9 @@ pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 pub use providers::{Timeouts, user_agent};
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
-    ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_EVICTED_NOTE,
-    IMAGE_OMITTED_NOTE, IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource,
-    Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, ThinkingFallback, UsageLimit,
-    adapt_images_for_model, dialect,
+    ContentBlock, DEFER_LOADING_KEY, EMPTY_RESPONSE_MARKER, Effort, EffortDialect,
+    IMAGE_EVICTED_NOTE, IMAGE_OMITTED_NOTE, IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType,
+    ImageSource, Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions,
+    Role, StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, ThinkingFallback, UsageLimit,
+    adapt_images_for_model, dialect, is_deferred_tool,
 };

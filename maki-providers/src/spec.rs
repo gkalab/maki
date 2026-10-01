@@ -52,6 +52,11 @@ pub struct ProviderSpec {
 
     pub family: ModelFamily,
     pub supports_thinking: bool,
+    /// The endpoint honours `defer_loading` and expands `tool_reference`
+    /// blocks. A property of the backend, not the protocol, so a slug that
+    /// borrows this row's protocol does not inherit it; see
+    /// [`crate::Model::supports_deferred_tools`].
+    pub supports_deferred_tools: bool,
     pub accepts_arbitrary_models: bool,
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,

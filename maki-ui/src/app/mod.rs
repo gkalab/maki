@@ -543,6 +543,25 @@ impl App {
         self.active_chat == 0
     }
 
+    /// Whether the chat in front shows the input box. A running subagent's
+    /// chat does, so a message can be queued for that subagent while it is
+    /// watched. A finished one is a transcript, so it does not.
+    pub(super) fn chat_accepts_input(&self) -> bool {
+        self.is_main_chat() || !self.chats[self.active_chat].is_finished()
+    }
+
+    /// One input box serves every chat, so the draft in it moves to the chat
+    /// being left and the new chat's draft comes back. Without this, `Enter`
+    /// in a subagent's chat would send a message typed for the main agent.
+    pub(super) fn set_active_chat(&mut self, idx: usize) {
+        if idx == self.active_chat {
+            return;
+        }
+        let draft = mem::take(&mut self.chats[idx].draft);
+        self.chats[self.active_chat].draft = self.input_box.swap_draft(draft);
+        self.active_chat = idx;
+    }
+
     fn plan_form_open(&self) -> bool {
         self.state.mode == Mode::Plan && self.plan_form.is_visible()
     }
@@ -807,7 +826,7 @@ impl App {
             Msg::Key(key) => self.handle_key(key),
             Msg::Paste(text) => {
                 if text.is_empty() {
-                    if self.is_main_chat() && self.image_paste_rx.is_empty() {
+                    if self.chat_accepts_input() && self.image_paste_rx.is_empty() {
                         self.start_image_paste();
                     }
                 } else {
@@ -884,7 +903,7 @@ impl App {
         }
         if key::QUIT.matches(key) {
             self.command_palette.close();
-            return Some(if !self.is_main_chat() || self.input_box.is_empty() {
+            return Some(if !self.chat_accepts_input() || self.input_box.is_empty() {
                 if self.status == Status::Streaming {
                     return Some(self.handle_cancel());
                 }
@@ -1016,7 +1035,9 @@ impl App {
             });
         }
 
-        if self.queue.focus().is_some() {
+        // The panel in a subagent chat shows that subagent's inbox, which
+        // the session queue's focus does not reach.
+        if self.is_main_chat() && self.queue.focus().is_some() {
             match key.code {
                 KeyCode::Up => self.queue.move_focus_up(),
                 KeyCode::Down => self.queue.move_focus_down(),
@@ -1102,7 +1123,8 @@ impl App {
         //
         // Ctrl keys pass it by, as they always did: `Ctrl+C` closes it and the
         // rest belong to the input box and the built-in bindings. So does every
-        // key in a subagent chat, where there is no input to complete.
+        // key in a subagent chat, where the text is for the subagent and slash
+        // commands would act on the session behind it.
         if self.is_main_chat() && !is_ctrl(&key) {
             match self
                 .command_palette
@@ -1159,12 +1181,10 @@ impl App {
                 };
             }
             BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
-            BuiltinAction::PopQueue => {
-                self.queue.remove(0);
-            }
-            BuiltinAction::PrevChat => self.active_chat = self.active_chat.saturating_sub(1),
+            BuiltinAction::PopQueue => self.pop_active_queue(),
+            BuiltinAction::PrevChat => self.set_active_chat(self.active_chat.saturating_sub(1)),
             BuiltinAction::NextChat => {
-                self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
+                self.set_active_chat((self.active_chat + 1).min(self.chats.len() - 1));
             }
             BuiltinAction::ModelPicker => {
                 self.model_picker.open(&self.state.model.spec());
@@ -1224,25 +1244,7 @@ impl App {
             return vec![];
         }
 
-        if !self.is_main_chat() {
-            return match key.code {
-                KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                KeyCode::Escape if !self.chats[self.active_chat].is_finished() => {
-                    if let Some(t) = self.last_esc.take()
-                        && t.elapsed() < self.status_bar.flash_duration
-                    {
-                        self.handle_subagent_cancel()
-                    } else {
-                        self.last_esc = Some(Instant::now());
-                        self.status_bar.flash(FLASH_CANCEL.into());
-                        vec![]
-                    }
-                }
-                _ => vec![],
-            };
-        }
-
-        self.handle_main_chat_key(key)
+        self.handle_chat_key(key)
     }
 
     /// The keys the host answers before any plugin *binding* sees them.
@@ -1287,7 +1289,18 @@ impl App {
         })
     }
 
-    fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+    /// A message typed while watching a running subagent is for that
+    /// subagent, see [`Self::queue_for_subagent`]. `Esc` follows the chat in front
+    /// too: armed twice in a running subagent's chat it cancels that subagent
+    /// alone. A finished subagent's chat has no input, so only the mode
+    /// toggle answers there.
+    fn handle_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if !self.chat_accepts_input() {
+            return match key.code {
+                KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                _ => vec![],
+            };
+        }
         if key::EDIT_INPUT.matches(key) {
             return self.run_builtin(BuiltinAction::EditInput);
         }
@@ -1332,33 +1345,37 @@ impl App {
                         vec![]
                     }
                     KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                    KeyCode::Escape => {
-                        if let Some(t) = self.last_esc.take()
-                            && t.elapsed() < self.status_bar.flash_duration
-                        {
-                            if streaming {
-                                self.handle_cancel()
-                            } else {
-                                self.open_rewind_picker()
-                            }
-                        } else {
-                            self.last_esc = Some(Instant::now());
-                            self.status_bar.flash(
-                                if streaming {
-                                    FLASH_CANCEL
-                                } else {
-                                    FLASH_REWIND
-                                }
-                                .into(),
-                            );
-                            vec![]
-                        }
-                    }
+                    KeyCode::Escape => self.handle_esc(streaming),
                     _ => vec![],
                 }
             }
             InputAction::ContinueLine | InputAction::None => vec![],
         }
+    }
+
+    fn handle_esc(&mut self, streaming: bool) -> Vec<Action> {
+        let in_subagent = !self.is_main_chat();
+        let armed = self
+            .last_esc
+            .take()
+            .is_some_and(|t| t.elapsed() < self.status_bar.flash_duration);
+        if armed {
+            return if in_subagent {
+                self.handle_subagent_cancel()
+            } else if streaming {
+                self.handle_cancel()
+            } else {
+                self.open_rewind_picker()
+            };
+        }
+        self.last_esc = Some(Instant::now());
+        let hint = if in_subagent || streaming {
+            FLASH_CANCEL
+        } else {
+            FLASH_REWIND
+        };
+        self.status_bar.flash(hint.into());
+        vec![]
     }
 
     fn quit(&mut self) -> Vec<Action> {
@@ -1401,6 +1418,9 @@ impl App {
         }
         if sub.is_empty() {
             return vec![];
+        }
+        if !self.is_main_chat() {
+            return self.queue_for_subagent(sub.into());
         }
         if sub.text.trim() == "exit" {
             return self.quit();
@@ -1624,6 +1644,8 @@ impl App {
         if let ChatEventResult::QueueItemConsumed { text, images } = result {
             if chat_idx == 0 {
                 self.on_queue_item_consumed(text, images);
+            } else {
+                self.chats[chat_idx].show_user_message(text, images);
             }
             return vec![];
         }
@@ -1732,6 +1754,7 @@ impl App {
         chat.set_restore_channel(self.restore_event_tx.clone());
         chat.model_id = subagent.model.clone();
         chat.opts = subagent.opts;
+        chat.inbox = subagent.inbox.clone();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
@@ -2368,7 +2391,7 @@ impl App {
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
-        if !self.is_main_chat() {
+        if !self.chat_accepts_input() {
             return;
         }
         if let InputAction::Changed = self.input_box.handle_paste(text) {

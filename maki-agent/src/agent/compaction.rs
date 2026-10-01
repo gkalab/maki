@@ -1294,16 +1294,8 @@ mod tests {
         let mut messages = vec![Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: OLD_RESULT.into(),
-                    is_error: false,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t2".into(),
-                    content: NEW_RESULT.into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("t1", OLD_RESULT, false),
+                ContentBlock::tool_result("t2", NEW_RESULT, false),
                 ContentBlock::Text {
                     text: KEPT_TEXT.into(),
                 },
@@ -1341,16 +1333,8 @@ mod tests {
                 Message {
                     role: Role::User,
                     content: vec![
-                        ContentBlock::ToolResult {
-                            tool_use_id: "t1".into(),
-                            content: OLD_RESULT.into(),
-                            is_error: false,
-                        },
-                        ContentBlock::ToolResult {
-                            tool_use_id: "t2".into(),
-                            content: NEW_RESULT.into(),
-                            is_error: false,
-                        },
+                        ContentBlock::tool_result("t1", OLD_RESULT, false),
+                        ContentBlock::tool_result("t2", NEW_RESULT, false),
                     ],
                     ..Default::default()
                 },
@@ -1394,11 +1378,7 @@ mod tests {
     }
 
     fn tool_result(id: &str) -> ContentBlock {
-        ContentBlock::ToolResult {
-            tool_use_id: id.into(),
-            content: "output".into(),
-            is_error: false,
-        }
+        ContentBlock::tool_result(id, "output", false)
     }
 
     #[track_caller]
@@ -1597,11 +1577,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "output".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("t1", "output", false)],
                 ..Default::default()
             },
             Message::user("keep me".into()),
@@ -1679,11 +1655,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "output".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("t1", "output", false)],
                 ..Default::default()
             },
             Message::user("keep me".into()),

@@ -6221,9 +6221,9 @@ or switched tab in between. Five checks refuse the edit:
   versions from zero.
 - A chat input the user cannot see, since text written there would be
   sent later without ever being read. A permission prompt, the plan form,
-  a pack review, a `below` split, a focused subagent chat and a terminal
-  too short to give the box a text row all take it off screen, and a
-  picker, a modal or a focused plugin window covers it.
+  a pack review, a `below` split, a finished subagent's chat and a
+  terminal too short to give the box a text row all take it off screen,
+  and a picker, a modal or a focused plugin window covers it.
 
 Read again and retry on any of them.
 

@@ -45,6 +45,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Generic,
     supports_thinking: false,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
@@ -701,7 +702,7 @@ fn messages_body(
         "model": model.id,
         "max_tokens": model.output_tokens().unwrap_or(shared::FALLBACK_MAX_TOKENS),
         "system": [{"type": "text", "text": system}],
-        "messages": shared::wire_messages(messages),
+        "messages": shared::wire_messages(messages, tools),
         "tools": tools,
         "stream": true,
     });

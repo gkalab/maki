@@ -33,6 +33,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: OLLAMA.api_key_env,
     family: ModelFamily::Generic,
     supports_thinking: false,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,

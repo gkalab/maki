@@ -171,8 +171,6 @@ local function create_bash_view(command, ctx)
   return buf, view
 end
 
-local cwd = maki.uv.cwd() or "."
-
 local COMPLEX_TYPES = {
   command_substitution = true,
   process_substitution = true,
@@ -253,7 +251,7 @@ local function collect_commands(node, source)
 end
 
 local description = [[Execute a bash command.
-Commands run in ]] .. cwd .. [[ by default.
+Commands run in the session's working directory (see Environment) by default.
 
 - **DO NOT** use for file ops! Only git, builds, tests, and system commands.
 - Use `workdir` param instead of `cd <dir> && <cmd>` patterns.

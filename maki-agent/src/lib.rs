@@ -17,8 +17,11 @@ pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerS
 pub use mcp::protocol::PromptRole;
 pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
+    ToolDeferral,
 };
+pub mod inbox;
 pub mod session;
+pub use inbox::SubagentInbox;
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,

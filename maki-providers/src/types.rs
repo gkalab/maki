@@ -145,6 +145,13 @@ pub const IMAGE_EVICTED_NOTE: &str = "[image omitted: too many images in this co
 pub const IMAGE_PLACEHOLDER: &str = "[image]";
 /// See [`Message::empty_marker`].
 pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
+/// Marks a definition the API keeps out of the model's context until a
+/// `tool_reference` loads it (see [`crate::Model::supports_deferred_tools`]).
+pub const DEFER_LOADING_KEY: &str = "defer_loading";
+
+pub fn is_deferred_tool(tool: &Value) -> bool {
+    tool[DEFER_LOADING_KEY].as_bool() == Some(true)
+}
 
 /// The last stop before the wire for every image in a request, whatever put
 /// it there. For models without vision, image blocks become a text note
@@ -274,6 +281,12 @@ pub enum ContentBlock {
         content: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+        /// Wire names of deferred tools this result loaded. A provider with
+        /// API-side deferral replays them as `tool_reference` blocks, so the
+        /// definitions expand here instead of rewriting the cached tools
+        /// prefix; everyone else ignores them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        loaded_tools: Vec<String>,
     },
     Image {
         source: ImageSource,
@@ -315,6 +328,19 @@ impl ContentBlock {
             name: name.into(),
             input,
             thought_signature: None,
+        }
+    }
+
+    pub fn tool_result(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
+        Self::ToolResult {
+            tool_use_id: tool_use_id.into(),
+            content: content.into(),
+            is_error,
+            loaded_tools: Vec::new(),
         }
     }
 }
@@ -1251,6 +1277,18 @@ mod tests {
         assert_eq!(observation["kind"], "observation");
     }
 
+    /// A result that loaded nothing must serialize to the same bytes as
+    /// before, or every provider's cached transcript breaks on upgrade.
+    #[test]
+    fn tool_result_loaded_tools_is_backward_compatible() {
+        let stored = json!({ "type": "tool_result", "tool_use_id": "t1", "content": "ok" });
+        let old: ContentBlock = serde_json::from_value(stored.clone()).unwrap();
+        assert!(
+            matches!(&old, ContentBlock::ToolResult { loaded_tools, .. } if loaded_tools.is_empty())
+        );
+        assert_eq!(serde_json::to_value(&old).unwrap(), stored);
+    }
+
     #[test_case(ImageMediaType::Png,  "image/png"  ; "png")]
     #[test_case(ImageMediaType::Jpeg, "image/jpeg" ; "jpeg")]
     #[test_case(ImageMediaType::Gif,  "image/gif"  ; "gif")]
@@ -1432,11 +1470,7 @@ mod tests {
     fn adapt_images_replaces_blocks_for_text_only_model() {
         let mut model = clamp_test_model(anthropic_spec());
         model.supports_vision_override = Some(false);
-        let tool_result = ContentBlock::ToolResult {
-            tool_use_id: "t1".into(),
-            content: "[image: pic.png 1KB]".into(),
-            is_error: false,
-        };
+        let tool_result = ContentBlock::tool_result("t1", "[image: pic.png 1KB]", false);
         let blocks = adapt(&model, vec![tool_result, unreadable_block()]);
         assert_eq!(blocks.len(), 2);
         assert!(matches!(&blocks[0], ContentBlock::ToolResult { .. }));

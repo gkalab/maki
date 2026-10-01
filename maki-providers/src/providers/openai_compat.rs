@@ -1022,11 +1022,7 @@ data: [DONE]\n";
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "tc_1".to_string(),
-                    content: "file.txt".to_string(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("tc_1", "file.txt", false)],
                 ..Default::default()
             },
         ];
@@ -1316,11 +1312,7 @@ data: [DONE]\n";
         let msgs = vec![Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "[image: pic.png 1KB]".into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("t1", "[image: pic.png 1KB]", false),
                 ContentBlock::Image {
                     source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
                 },

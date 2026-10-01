@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
+use crate::components::input::Submission;
 use crate::components::messages::{MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
 use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
@@ -14,7 +15,7 @@ use crate::markdown::truncate_output;
 use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{
-    AgentEvent, BufferSnapshot, SteerKind, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, BufferSnapshot, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
@@ -35,6 +36,8 @@ const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
 const REWRITTEN_PREFIX: &str = "A plugin rewrote this message. The model got:";
 const DROPPED_PREFIX: &str = "A plugin kept this message from the model:";
 const CONTINUED_PREFIX: &str = "A plugin kept the agent going:";
+pub(crate) const INBOX_DROPPED_SUFFIX: &str =
+    " queued message(s) dropped: the subagent finished first";
 
 pub enum ChatEventResult {
     Continue,
@@ -64,6 +67,11 @@ pub struct Chat {
     /// A subagent's own settings; `None` on the main chat, which reads the
     /// session's.
     pub opts: Option<RequestOptions>,
+    /// A running subagent's inbox for messages typed in its chat. Taken when
+    /// the chat finishes, since nothing would drain it after that.
+    pub(crate) inbox: Option<Arc<SubagentInbox>>,
+    /// Parked while another chat is in front, see `App::set_active_chat`.
+    pub(crate) draft: Submission,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
@@ -91,6 +99,8 @@ impl Chat {
             context_size: 0,
             model_id: None,
             opts: None,
+            inbox: None,
+            draft: Submission::default(),
             pending_turn_usage: None,
             messages_panel,
             finish: None,
@@ -413,6 +423,13 @@ impl Chat {
             return;
         }
         self.messages_panel.flush();
+        let undelivered = self.inbox.take().map_or(0, |inbox| inbox.len());
+        if undelivered > 0 {
+            self.messages_panel.push(DisplayMessage::new(
+                DisplayRole::Error,
+                format!("{undelivered}{INBOX_DROPPED_SUFFIX}"),
+            ));
+        }
         let bubble = self
             .messages_panel
             .push(DisplayMessage::new(outcome.role(), text.into()));
@@ -752,6 +769,7 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } = block
             {
                 map.insert(tool_use_id.as_str(), (*is_error, content.as_str()));
@@ -789,11 +807,7 @@ mod tests {
         let tool_result = Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: TASK_ID.into(),
-                    content: USER_TEXT.into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result(TASK_ID, USER_TEXT, false),
                 ContentBlock::Image { source: image() },
             ],
             ..Default::default()
@@ -1087,11 +1101,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: result.into(),
-                    is_error,
-                }],
+                content: vec![ContentBlock::tool_result("t1", result, is_error)],
                 ..Default::default()
             },
         ]
@@ -1127,11 +1137,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "hi".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("t1", "hi", false)],
                 ..Default::default()
             },
             Message {

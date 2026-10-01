@@ -110,11 +110,10 @@ impl App {
         self.chats[self.active_chat].task_id_or_main()
     }
 
-    /// The only writer of `active_chat` outside the chat cycling keys. Tasks
-    /// are looked up by id, never by position and never through `chat_index`,
-    /// a routing cache wiped at the end of every turn.
+    /// Tasks are looked up by id, never by position and never through
+    /// `chat_index`, a routing cache wiped at the end of every turn.
     pub(crate) fn focus_task(&mut self, id: &str) -> Result<(), String> {
-        self.active_chat = if id == MAIN_TASK_ID {
+        let idx = if id == MAIN_TASK_ID {
             0
         } else {
             self.chats
@@ -122,6 +121,7 @@ impl App {
                 .position(|chat| chat.task_id().is_some_and(|task_id| &**task_id == id))
                 .ok_or_else(|| format!("{UNKNOWN_TASK_ERR}{id}"))?
         };
+        self.set_active_chat(idx);
         Ok(())
     }
 }

@@ -72,6 +72,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Glm,
     supports_thinking: false,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: false,
     fallback_max_output: Some(16_000),
     fallback_context_window: 128_000,

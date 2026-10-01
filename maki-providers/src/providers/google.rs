@@ -53,6 +53,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     api_key_env: ENV_VAR,
     family: ModelFamily::Gemini,
     supports_thinking: true,
+    supports_deferred_tools: false,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
@@ -373,6 +374,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     tool_use_id,
                     content,
                     is_error,
+                    ..
                 } => {
                     let parsed = serde_json::from_str::<Value>(content);
                     let mut response_val = match parsed {
@@ -873,11 +875,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "file contents".into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("call_1", "file contents", false)],
                 ..Default::default()
             },
         ];
@@ -902,11 +900,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: content.into(),
-                    is_error: false,
-                }],
+                content: vec![ContentBlock::tool_result("call_1", content, false)],
                 ..Default::default()
             },
         ];
@@ -927,11 +921,7 @@ mod tests {
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "boom".into(),
-                    is_error: true,
-                }],
+                content: vec![ContentBlock::tool_result("call_1", "boom", true)],
                 ..Default::default()
             },
         ];
@@ -970,11 +960,7 @@ mod tests {
         let messages = vec![Message {
             role: Role::User,
             content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "call_1".into(),
-                    content: "[image: pic.png 1KB]".into(),
-                    is_error: false,
-                },
+                ContentBlock::tool_result("call_1", "[image: pic.png 1KB]", false),
                 ContentBlock::Image {
                     source: crate::ImageSource::new(
                         crate::ImageMediaType::Png,

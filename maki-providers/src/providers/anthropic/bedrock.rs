@@ -561,6 +561,9 @@ impl Provider for Bedrock {
             if has_examples {
                 betas.push(shared::BETA_TOOL_EXAMPLES_BEDROCK);
             }
+            if shared::has_deferred_tools(tools) {
+                betas.push(shared::BETA_DEFERRED_TOOLS_BEDROCK);
+            }
             if long_context {
                 betas.push(shared::LONG_CONTEXT_BETA);
             }

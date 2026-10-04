@@ -97,7 +97,7 @@ mod tests {
         modal
     }
 
-    #[test_case(key_ev(KeyCode::Esc)     ; "esc_dismisses")]
+    #[test_case(key_ev(KeyCode::Escape)  ; "esc_dismisses")]
     #[test_case(key_ev(KeyCode::Enter)   ; "enter_dismisses")]
     #[test_case(key::QUIT.to_key_event() ; "ctrl_c_dismisses")]
     fn handle_key_dismisses(k: KeyEvent) {

@@ -351,7 +351,6 @@ mod tests {
     use super::*;
     use crate::components::keybindings::key as kb;
     use crate::components::{buffer_text, key};
-    use crossterm::event::{KeyCode, KeyEvent};
     use maki_providers::ModelInfo;
     use maki_providers::ModelPricing;
     use ratatui::Terminal;

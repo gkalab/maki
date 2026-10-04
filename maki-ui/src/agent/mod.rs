@@ -39,7 +39,6 @@ pub(crate) struct AgentHandles {
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedMessages,
-    pub(crate) btw_system: Arc<ArcSwap<String>>,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
@@ -92,7 +91,6 @@ impl AgentHandles {
     pub(crate) fn apply_to_app(&self, app: &mut App) {
         app.answer_tx = Some(self.answer_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
-        app.btw_system = Some(Arc::clone(&self.btw_system));
         app.queue.set_shared(self.queue.clone());
         let restore_tx =
             maki_agent::EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
@@ -155,6 +153,7 @@ impl AgentHandles {
                 // A respawn carries the app's last reported count across, so
                 // the next request is not left guessing at its own prompt.
                 context_size: app.state.context_size,
+                frame: app.state.session.frame().cloned(),
                 session: None,
             },
             config,
@@ -235,7 +234,6 @@ fn spawn_agent_internal(
     let shared_history: SharedMessages =
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
     maki_agent::agent::publish_live_history(resumed.id.id(), &shared_history);
-    let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let cancels = RunCancels::new();
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let mailbox = SessionMailbox::register(resumed.id.id());
@@ -246,7 +244,6 @@ fn spawn_agent_internal(
         tool_output_lines,
         resumed,
         Arc::clone(&shared_history),
-        Arc::clone(&btw_system),
         mcp_handle.clone(),
         Arc::clone(permissions),
         agent_tx.clone(),
@@ -267,7 +264,6 @@ fn spawn_agent_internal(
         agent_tx,
         answer_tx,
         history: shared_history,
-        btw_system,
         mcp_handle,
         mcp_config_errors,
         queue: queue_tx,

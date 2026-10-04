@@ -706,6 +706,12 @@ pub enum AgentEvent {
     },
     AuthRequired,
     Nudge,
+    /// One line for the user about something the host did that the transcript
+    /// won't show, like telling the model the date changed or rebuilding the
+    /// prompt.
+    Notice {
+        text: String,
+    },
     /// A plugin changed the run in a way the transcript alone would not show.
     /// `text` is the message as sent, the reason for a drop, or the message
     /// that kept the run going.

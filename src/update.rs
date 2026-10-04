@@ -70,13 +70,17 @@ fn fetch_script() -> Result<String, UpdateError> {
         })
 }
 
-fn backup_binary(exe_path: &Path, storage: &StateDir) -> Result<PathBuf, UpdateError> {
-    let backup_path = storage.path().join(BACKUP_FILENAME);
-    std::fs::copy(exe_path, &backup_path).map_err(|e| UpdateError::Backup {
-        path: backup_path.clone(),
+/// Where `maki update` keeps the binary it replaced, for `maki rollback`.
+pub fn backup_path() -> Result<PathBuf, StorageError> {
+    Ok(StateDir::resolve()?.path().join(BACKUP_FILENAME))
+}
+
+fn backup_binary(exe_path: &Path, backup_path: &Path) -> Result<(), UpdateError> {
+    std::fs::copy(exe_path, backup_path).map_err(|e| UpdateError::Backup {
+        path: backup_path.to_path_buf(),
         source: e,
     })?;
-    Ok(backup_path)
+    Ok(())
 }
 
 fn execute_script(script: &str, install_dir: &Path) -> Result<(), UpdateError> {
@@ -183,7 +187,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
             })?
             .to_path_buf(),
     };
-    let storage = StateDir::resolve()?;
+    let backup_path = backup_path()?;
 
     let script = fetch_script()?;
 
@@ -198,7 +202,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
         return Ok(());
     }
 
-    let backup_path = backup_binary(&exe_path, &storage)?;
+    backup_binary(&exe_path, &backup_path)?;
 
     execute_script(&script, &install_dir)?;
 
@@ -212,8 +216,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
 
 pub fn rollback() -> Result<(), UpdateError> {
     let exe_path = current_exe_resolved()?;
-    let storage = StateDir::resolve()?;
-    let backup_path = storage.path().join(BACKUP_FILENAME);
+    let backup_path = backup_path()?;
 
     if !backup_path.exists() {
         return Err(UpdateError::NoBackup(backup_path));

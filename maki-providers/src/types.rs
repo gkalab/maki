@@ -11,25 +11,20 @@ use std::fmt;
 use std::sync::{Arc, OnceLock};
 
 use jiff::Timestamp;
+use maki_storage::frame::FactsUpdate;
 use maki_storage::intern;
 pub use maki_storage::sessions::Effort;
-use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
+use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, THINKING_ADAPTIVE, TitleSource};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use strum::{Display, IntoStaticStr};
 use tracing::warn;
 
 use crate::TokenUsage;
-use crate::image::{Fix, MAX_IMAGES, fix_for_wire};
+use crate::image::{Fix, IMAGE_EVICTION_STEP, MAX_IMAGES, fix_for_wire};
 use crate::model::Model;
 
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
-
-/// The two thinking modes that are neither an effort level nor a token count.
-/// `Display` and [`Model::thinking_options`] both spell them from here, so the
-/// picker offers exactly the strings the parser accepts.
-pub(crate) const THINKING_OFF: &str = "off";
-pub(crate) const THINKING_ADAPTIVE: &str = "adaptive";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
@@ -186,22 +181,18 @@ pub async fn adapt_images_for_model<'a>(
         .collect();
     let note = |text: &str| ContentBlock::Text { text: text.into() };
     let vision = model.supports_vision();
+    let kept = images_kept(images.len());
     let mut edits: Vec<(usize, usize, ContentBlock)> = Vec::new();
-    // Counts survivors, not blocks, or an image nobody can read would cost a
-    // good one its place. Nothing past the cap is decoded at all.
-    let mut kept = 0;
-    for (m, b, source) in images {
+    // Nothing past the cap is decoded at all.
+    for (newest_first, (m, b, source)) in images.into_iter().enumerate() {
         if !vision {
             edits.push((m, b, note(IMAGE_OMITTED_NOTE)));
-        } else if kept == MAX_IMAGES {
+        } else if newest_first >= kept {
             edits.push((m, b, note(IMAGE_EVICTED_NOTE)));
         } else {
             match fix_for_wire(&source).await {
-                Fix::Keep => kept += 1,
-                Fix::Replace(source) => {
-                    kept += 1;
-                    edits.push((m, b, ContentBlock::Image { source }));
-                }
+                Fix::Keep => {}
+                Fix::Replace(source) => edits.push((m, b, ContentBlock::Image { source })),
                 Fix::Drop => edits.push((m, b, note(IMAGE_UNUSABLE_NOTE))),
             }
         }
@@ -235,10 +226,20 @@ pub async fn adapt_images_for_model<'a>(
             role: message.role.clone(),
             content,
             display_text: message.display_text.clone(),
-            kind: message.kind,
+            kind: message.kind.clone(),
         });
     }
     Cow::Owned(adapted)
+}
+
+/// How many of the newest `total` images a request keeps. Past the cap a
+/// whole [`IMAGE_EVICTION_STEP`] of the oldest goes at once, and new images
+/// fill the gap one by one. It depends on the count alone, never on which
+/// images decode, so which ones are evicted only moves once per step. An
+/// unreadable image therefore holds its slot until it ages out.
+fn images_kept(total: usize) -> usize {
+    let over = total.saturating_sub(MAX_IMAGES);
+    total - over.div_ceil(IMAGE_EVICTION_STEP) * IMAGE_EVICTION_STEP
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -304,8 +305,9 @@ impl ContentBlock {
 /// travel as a user message, and without this there is no way to tell it
 /// apart from the user actually typing. A prefix in the text would not do:
 /// a log line can print one.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum MessageKind {
     /// Someone said this, the user or the model.
     #[default]
@@ -313,6 +315,14 @@ pub enum MessageKind {
     /// The host noticed it and passed it to the model. It stays in session
     /// history for conversation order but is hidden from user-facing views.
     Observation,
+    /// Something the system prompt said has changed (date, model, plan
+    /// mode...). Editing the prompt would void the cache and every thinking
+    /// block bound to it, so we append this instead. Views only show its
+    /// `display_text` summary.
+    ///
+    /// It carries the facts it told, so what the model holds true can be read
+    /// off the transcript, even after a resume or a rewind.
+    ContextUpdate(Arc<FactsUpdate>),
 }
 
 impl MessageKind {
@@ -384,6 +394,30 @@ impl Message {
 
     pub fn is_observation(&self) -> bool {
         self.kind == MessageKind::Observation
+    }
+
+    pub fn context_update(text: String, summary: String, update: FactsUpdate) -> Self {
+        Self {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text }],
+            display_text: Some(summary),
+            kind: MessageKind::ContextUpdate(Arc::new(update)),
+        }
+    }
+
+    pub fn is_context_update(&self) -> bool {
+        self.facts_update().is_some()
+    }
+
+    pub fn facts_update(&self) -> Option<&FactsUpdate> {
+        match &self.kind {
+            MessageKind::ContextUpdate(update) => Some(update),
+            _ => None,
+        }
+    }
+
+    pub fn is_from_host(&self) -> bool {
+        !self.kind.is_turn()
     }
 
     pub fn user(text: String) -> Self {
@@ -460,7 +494,7 @@ impl Message {
 
 impl TitleSource for Message {
     fn first_user_text(&self) -> Option<&str> {
-        if !self.role.is_user() || self.is_observation() {
+        if !self.role.is_user() || self.is_from_host() {
             return None;
         }
         self.user_text()
@@ -553,6 +587,13 @@ fn claude_version(model_id: &str) -> Option<(&str, (u32, u32))> {
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
     Some((family, (major, minor)))
+}
+
+/// The releases that made thinking adaptive-only also reject any sampling
+/// parameter (`top_p`, `temperature`) with a 400, even with thinking off.
+/// Reads the id, not the provider, so a gateway serving Claude is covered too.
+pub(crate) fn rejects_sampling(model_id: &str) -> bool {
+    ThinkingConfig::requires_adaptive(model_id)
 }
 
 /// How a provider's effort knob speaks: which levels its API accepts, what
@@ -1058,12 +1099,7 @@ impl ThinkingConfig {
 
 impl std::fmt::Display for ThinkingConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Off => f.write_str(THINKING_OFF),
-            Self::Adaptive => f.write_str(THINKING_ADAPTIVE),
-            Self::Effort(e) => f.write_str(e.as_str()),
-            Self::Budget(n) => write!(f, "{n}"),
-        }
+        write!(f, "{}", StoredThinking::from(*self))
     }
 }
 
@@ -1117,11 +1153,25 @@ impl RequestOptions {
     }
 }
 
-#[derive(Debug)]
+/// A change the API made to the request before the model read it, such as a
+/// thinking block dropped because the prefix it was bound to changed. Kinds
+/// and reasons stay strings, because the API keeps adding new ones.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InputTransformation {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Default)]
 pub struct StreamResponse {
     pub message: Message,
     pub usage: TokenUsage,
     pub stop_reason: Option<StopReason>,
+    pub input_transformations: Vec<InputTransformation>,
 }
 
 /// Provider-reported usage quota, independent of local token accounting. Not every
@@ -1206,7 +1256,11 @@ fn deserialize_reset_at<'de, D: Deserializer<'de>>(
 #[cfg(test)]
 mod tests {
 
+    use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    use maki_storage::frame::PlanChange;
+    use maki_storage::sessions::generate_title;
 
     use super::*;
     use crate::model::ThinkingSupport as Support;
@@ -1225,6 +1279,15 @@ mod tests {
     const SMALL_BUDGET: u32 = 2048;
     /// Between `Medium` and `High` against [`FALLBACK_MAX_THINKING_BUDGET`].
     const LARGE_BUDGET: u32 = 16_384;
+
+    const PROMPT: &str = "fix the flaky login test";
+    const UPDATE_TEXT: &str = "<context-update>plan mode is on</context-update>";
+    const UPDATE_SUMMARY: &str = "Plan mode on";
+    const UPDATE_DATE: &str = "2026-10-02";
+    const UPDATE_PLAN: &str = "/project/.maki/plan.md";
+    const UPDATE_HINT_SLOT: &str = "memory/tags";
+    const GONE_HINT_SLOT: &str = "todo/after_instructions";
+    const UPDATE_HINT: &str = "rust, cache";
 
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
     #[test_case("tool_use", StopReason::ToolUse   ; "tool_use")]
@@ -1275,6 +1338,55 @@ mod tests {
         assert_eq!(observation.first_user_text(), None);
         let observation = serde_json::to_value(observation).unwrap();
         assert_eq!(observation["kind"], "observation");
+        let loaded: Message = serde_json::from_value(observation).unwrap();
+        assert_eq!(loaded.kind, MessageKind::Observation);
+    }
+
+    fn plan_mode_facts() -> FactsUpdate {
+        FactsUpdate {
+            date: Some(UPDATE_DATE.into()),
+            plan: Some(PlanChange::Entered(UPDATE_PLAN.into())),
+            hints: BTreeMap::from([
+                (UPDATE_HINT_SLOT.into(), Some(UPDATE_HINT.into())),
+                (GONE_HINT_SLOT.into(), None),
+            ]),
+            ..FactsUpdate::default()
+        }
+    }
+
+    /// A resume reads what the model holds true from the stored updates, so
+    /// the format is pinned. If it drifts, a resumed session forgets plan mode
+    /// or the hints.
+    #[test]
+    fn context_update_keeps_its_stored_format() {
+        let stored = json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": UPDATE_TEXT }],
+            "display_text": UPDATE_SUMMARY,
+            "kind": { "context_update": {
+                "date": UPDATE_DATE,
+                "plan": { "entered": UPDATE_PLAN },
+                "hints": { UPDATE_HINT_SLOT: UPDATE_HINT, GONE_HINT_SLOT: null }
+            } }
+        });
+        let update =
+            Message::context_update(UPDATE_TEXT.into(), UPDATE_SUMMARY.into(), plan_mode_facts());
+        assert_eq!(serde_json::to_value(&update).unwrap(), stored);
+
+        let loaded: Message = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.facts_update(), Some(&plan_mode_facts()));
+        assert_eq!(loaded.display_text.as_deref(), Some(UPDATE_SUMMARY));
+    }
+
+    /// A first run in plan mode tells the model before the user's prompt, and
+    /// the session must still be named after what the user typed.
+    #[test_case(Message::context_update(UPDATE_TEXT.into(), UPDATE_SUMMARY.into(), plan_mode_facts()) ; "context_update")]
+    #[test_case(Message::observation(UPDATE_TEXT.into())                                               ; "observation")]
+    fn title_skips_what_the_host_wrote(host: Message) {
+        assert_eq!(
+            generate_title(&[host, Message::user(PROMPT.into())]),
+            PROMPT
+        );
     }
 
     /// A result that loaded nothing must serialize to the same bytes as
@@ -1441,29 +1553,67 @@ mod tests {
         );
     }
 
+    /// Evicting edits early messages, which voids the cache and the thinking
+    /// bound to them. So each new image must leave the request an append of
+    /// the one before, except at most once per step when the oldest images
+    /// make way, and the API cap is never crossed.
     #[test]
-    fn adapt_images_evicts_the_oldest_past_the_request_cap() {
-        const EXTRA: usize = 3;
+    fn adapt_images_moves_the_prefix_once_per_step() {
+        const LAST_TOTAL: usize = MAX_IMAGES + 2 * IMAGE_EVICTION_STEP + 1;
         let model = clamp_test_model(anthropic_spec());
-        let blocks = adapt(&model, (1..=MAX_IMAGES + EXTRA).map(png_block).collect());
-        assert_eq!(image_count(&blocks), MAX_IMAGES);
-        assert!(
-            matches!(&blocks[EXTRA - 1], ContentBlock::Text { text } if text == IMAGE_EVICTED_NOTE),
-            "the oldest images are the ones that make way"
-        );
-        assert!(matches!(&blocks[EXTRA], ContentBlock::Image { .. }));
+        let images: Vec<ContentBlock> = (1..=LAST_TOTAL).map(png_block).collect();
+        let wire = |blocks: &[ContentBlock]| serde_json::to_value(blocks).unwrap();
+        let mut before = adapt(&model, images[..MAX_IMAGES].to_vec());
+        let mut last_move: Option<usize> = None;
+        for total in MAX_IMAGES + 1..=LAST_TOTAL {
+            let after = adapt(&model, images[..total].to_vec());
+            let kept = image_count(&after);
+            assert!(kept <= MAX_IMAGES, "{kept} images sent");
+            assert!(
+                kept > MAX_IMAGES - IMAGE_EVICTION_STEP,
+                "{kept} of {total} images kept"
+            );
+            assert!(
+                after[..total - kept].iter().all(
+                    |b| matches!(b, ContentBlock::Text { text } if text == IMAGE_EVICTED_NOTE)
+                ),
+                "the oldest images are the ones that make way"
+            );
+            if wire(&after[..total - 1]) != wire(&before) {
+                assert!(
+                    last_move.is_none_or(|at| total - at >= IMAGE_EVICTION_STEP),
+                    "prefix moved at image {total}, last moved at {last_move:?}"
+                );
+                last_move = Some(total);
+            }
+            before = after;
+        }
     }
 
-    /// An image no provider could read frees no room, so the cap is spent on
-    /// survivors: counting blocks instead would evict a good one in its place.
+    /// Readability must not decide what is evicted: an unreadable image that
+    /// freed its slot would pull an evicted one back in, editing an early
+    /// message outside the step schedule.
     #[test]
-    fn adapt_images_drops_what_it_cannot_read_without_spending_the_cap() {
+    fn adapt_images_evicts_the_same_images_whatever_decodes() {
         let model = clamp_test_model(anthropic_spec());
-        let mut content = vec![png_block(1), unreadable_block()];
-        content.extend((2..=MAX_IMAGES).map(png_block));
+        let readable: Vec<ContentBlock> = (1..=MAX_IMAGES + 1).map(png_block).collect();
+        let mut content = readable.clone();
+        content[MAX_IMAGES] = unreadable_block();
+        let evicted = |blocks: &[ContentBlock]| -> Vec<usize> {
+            blocks
+                .iter()
+                .enumerate()
+                .filter(
+                    |(_, b)| matches!(b, ContentBlock::Text { text } if text == IMAGE_EVICTED_NOTE),
+                )
+                .map(|(i, _)| i)
+                .collect()
+        };
         let blocks = adapt(&model, content);
-        assert_eq!(image_count(&blocks), MAX_IMAGES);
-        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == IMAGE_UNUSABLE_NOTE));
+        assert_eq!(evicted(&blocks), evicted(&adapt(&model, readable)));
+        assert!(
+            matches!(&blocks[MAX_IMAGES], ContentBlock::Text { text } if text == IMAGE_UNUSABLE_NOTE)
+        );
     }
 
     #[test]

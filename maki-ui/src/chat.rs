@@ -254,6 +254,11 @@ impl Chat {
                     ));
                 }
             }
+            AgentEvent::Notice { text } => {
+                self.messages_panel.flush();
+                self.messages_panel
+                    .push(DisplayMessage::new(DisplayRole::Notice, text));
+            }
             AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
@@ -531,6 +536,10 @@ impl Chat {
     }
 }
 
+fn is_shown_prompt(msg: &Message) -> bool {
+    matches!(msg.role, Role::User) && !msg.is_from_host() && msg.user_text().is_some()
+}
+
 pub fn history_to_display(
     messages: &[Message],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
@@ -539,7 +548,22 @@ pub fn history_to_display(
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
-    for msg in messages {
+    // An update sent with a prompt sits before it in history, but live the
+    // prompt shows on submit and the update after. Restored, it keeps that
+    // order.
+    let mut told_with_prompt = None;
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.is_context_update() {
+            if let Some(summary) = &msg.display_text {
+                let notice = DisplayMessage::new(DisplayRole::Notice, summary.clone());
+                if messages.get(i + 1).is_some_and(is_shown_prompt) {
+                    told_with_prompt = Some(notice);
+                } else {
+                    display.push(notice);
+                }
+            }
+            continue;
+        }
         if msg.is_observation() {
             continue;
         }
@@ -559,6 +583,7 @@ pub fn history_to_display(
                         images,
                     ));
                 }
+                display.extend(told_with_prompt.take());
             }
             Role::Assistant => {
                 for block in &msg.content {
@@ -761,7 +786,7 @@ fn user_images(msg: &Message) -> Vec<ImageSource> {
 fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
     let mut map = HashMap::new();
     for msg in messages {
-        if !matches!(msg.role, Role::User) || msg.is_observation() {
+        if !matches!(msg.role, Role::User) || msg.is_from_host() {
             continue;
         }
         for block in &msg.content {
@@ -1085,6 +1110,33 @@ mod tests {
         assert_eq!(display.len(), 1);
         assert_eq!(display[0].role, DisplayRole::Assistant);
         assert_eq!(display[0].text, "I will fix it");
+    }
+
+    const UPDATE_SUMMARY: &str = "Told the model: date";
+    const PROMPT: &str = "fix the test";
+
+    fn update() -> Message {
+        Message::context_update(
+            "<context-update>Date is now tomorrow.</context-update>".into(),
+            UPDATE_SUMMARY.into(),
+            Default::default(),
+        )
+    }
+
+    /// Live, the prompt shows on submit and the update it carried after it,
+    /// so a restored transcript keeps that order.
+    #[test_case(vec![update()], &[(DisplayRole::Notice, UPDATE_SUMMARY)] ; "alone")]
+    #[test_case(vec![update(), Message::user(PROMPT.into())], &[(DisplayRole::User, PROMPT), (DisplayRole::Notice, UPDATE_SUMMARY)] ; "sent_with_a_prompt")]
+    fn history_shows_context_updates_as_their_summary(
+        msgs: Vec<Message>,
+        expected: &[(DisplayRole, &str)],
+    ) {
+        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        let shown: Vec<(DisplayRole, &str)> = display
+            .iter()
+            .map(|d| (d.role.clone(), d.text.as_str()))
+            .collect();
+        assert_eq!(shown, expected);
     }
 
     fn tool_use_pair(

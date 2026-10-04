@@ -112,6 +112,7 @@ The rules:
 | [`maki.async`](#maki-async) | Tools for running things concurrently in Lua plugins. |
 | [`maki.async.Semaphore`](#maki-async-Semaphore) | A counting semaphore for limiting how many tasks run at once. |
 | [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
+| [`maki.async.Task`](#maki-async-Task) | Handle returned by `maki.async.spawn`. |
 | [`maki.base64`](#maki-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
 | [`maki.env`](#maki-env) | Paths to maki's own directories (config, state, logs, legacy). |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
@@ -124,7 +125,8 @@ The rules:
 | [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.model`](#maki-model) | The model behind the focused session. |
-| [`maki.net`](#maki-net) | HTTP client for fetching web content. |
+| [`maki.net`](#maki-net) | HTTP and plain TCP for plugins. |
+| [`maki.net.Conn`](#maki-net-Conn) | A TCP connection opened by `maki.net.connect`. |
 | [`maki.provider`](#maki-provider) | Providers implemented in Lua. |
 | [`maki.provider.auth`](#maki-provider-auth) | Credential storage for the providers this plugin registered. |
 | [`maki.session`](#maki-session) | Host session primitives. |
@@ -224,11 +226,10 @@ Load an installed package that is not active.
 maki.defer_fn({callback}, {ms})
 ```
 
-Run {callback} after {ms} milliseconds, on the Lua thread and outside
-any task scope. The timer does not hang off the caller's cancel token
-or the 60 second `async.run` deadline, so the callback still fires
-once the tool call that scheduled it is over. That is what a toast
-needs to dismiss itself, and the difference from `maki.async.sleep`.
+Run {callback} once after {ms} milliseconds. It fires even if the tool
+call that scheduled it has ended or was cancelled, which is what a
+self-dismissing toast needs. For repeating work, use a
+`maki.async.sleep` loop inside `maki.async.spawn`.
 
 You get back a handle. Its `:stop()` cancels a callback that has not
 fired yet, which is how you debounce: schedule, then stop and
@@ -270,9 +271,8 @@ maki.notify({msg}, {level?}, {opts?})
 ```
 
 Show a one line notice. By default it goes to `maki.ui.flash`, with
-`{opts.title}` in front of the message when you pass one. A run with
-no UI, such as `maki -p` or the sdk, logs the notice instead of
-dropping it.
+`{opts.title}` in front of the message when you pass one. Without a UI
+(`maki -p`, the sdk, ACP), the notice goes to the log.
 
 There is one handler for the whole process. Once a plugin calls
 `maki.set_notify_handler`, notices from every plugin go through it.
@@ -374,7 +374,8 @@ Get package state without changing the installed set.
 - `{names?}` (`table?`) Package names. Omit for all managed packages.
 - `{opts?}` (`table?`) Reserved. Omit it.
 
-**Returns:** (`table`) Package records with `spec`, `path`, `rev`, and `active`.
+**Returns:** (`table?`, `string?`) Package records with `spec`, `path`, `rev`, and
+  `active`, or nil plus an error when the pack lockfile cannot be read.
 
 
 ## maki.api {#maki-api}
@@ -574,6 +575,10 @@ appear alongside other plugins' hints. If you need to own the whole slot
 
 Throws if you pass a singleton slot name.
 
+A function `content` is called before every run. Its first value goes in
+the system prompt, and later changes reach the model as a context update
+until the next compaction.
+
 **Parameters:**
 
 - `{spec}` (`table`) Hint specification:
@@ -640,7 +645,8 @@ Use this for slots like "identity" or "tone" where a single coherent value
 makes more sense than combining fragments. For aggregate slots like
 "tool_usage", use `register_prompt_hint` instead.
 
-Throws if you pass an aggregate slot name.
+Throws if you pass an aggregate slot name. A function `content` behaves
+as in `register_prompt_hint`.
 
 **Parameters:**
 
@@ -777,9 +783,9 @@ Listen for one or more events. Returns an id you can pass to
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
-`"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-`"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`, and
-`"FileIndexReady"`. Plugins can also fire their own events with
+`"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
+`"TaskStatusChanged"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
+and `"FileIndexReady"`. Plugins can also fire their own events with
 `exec_autocmds`.
 
 Every host event carries `data.session_id` except `"FileIndexReady"`,
@@ -813,6 +819,8 @@ name the session now running or focused. What each event adds:
   first focus at startup.
 - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
   or `"idle"`), `data.title`, and `data.focused` (boolean).
+- `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
+  when the title changes (rename or auto-generation).
 - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
   (`"working"`, `"done"`, or `"error"`), when a subagent starts or
   changes status. A task that comes back from disk already finished
@@ -1517,10 +1525,10 @@ the VM sits idle, and the subagent's event relay stays alive until it does.
 
 Tools for running things concurrently in Lua plugins.
 
-Use `run` to fire off background tasks, `gather` or `join` to run
-several functions at once, and `semaphore` to limit concurrency.
-The `await` and `wrap` helpers bridge callback-based APIs into
-coroutine-friendly calls.
+`run` starts a background task that ends with its caller, and `spawn`
+one that lives as long as the plugin. `gather` and `join` run several
+functions at once, and `semaphore` limits how many. `await` and `wrap`
+turn callback APIs into coroutine calls.
 
 ```lua
 local results = maki.async.gather({
@@ -1537,9 +1545,10 @@ local results = maki.async.gather({
 maki.async.run({fn}, {on_finish?})
 ```
 
-Fire off a function as a new async task. It runs in the background and
-you do not wait for it. If you need the result, pass an {on_finish}
-callback.
+Start {fn} as a background task without waiting for it. Pass
+{on_finish} to get the result. The task is cancelled with its caller
+and stopped after 60 seconds. For work that outlives the caller, use
+`maki.async.spawn`.
 
 **Parameters:**
 
@@ -1557,22 +1566,67 @@ end)
 
 ---
 
+### `maki.async.spawn()` {#maki-async-spawn}
+
+```lua
+maki.async.spawn({fn})
+```
+
+Run {fn} in a task that lives as long as your plugin, such as a
+repeating timer or a connection opened at load.
+
+The task has no deadline and outlives the call that started it, so a
+tool handler can spawn it and return. It ends when {fn} returns or
+raises, when you call `task:cancel()`, or when the plugin unloads.
+Errors are logged and flashed with the plugin name.
+
+Spawned at the top level of a plugin file, it starts after the plugin
+loads. It does not keep maki alive: `maki -p` drops it on exit.
+
+Code that runs 5 seconds without yielding is still stopped. See
+`maki.async.sleep`.
+
+**Parameters:**
+
+- `{fn}` (`function`) Zero-argument function to run.
+
+**Returns:** ([`maki.async.Task`](#maki-async-Task)) Handle with `:cancel()`.
+
+**Example:**
+
+```lua
+local task = maki.async.spawn(function()
+  while true do
+    maki.async.sleep(2000)
+    report()
+  end
+end)
+
+task:cancel()
+```
+
+---
+
 ### `maki.async.sleep()` {#maki-async-sleep}
 
 ```lua
 maki.async.sleep({ms})
 ```
 
-Suspend the calling task for {ms} milliseconds. The plugin thread is
-never blocked, so other tasks and the UI keep running, and a cancel
-still lands while you sleep.
+Suspend the calling task for {ms} milliseconds. Other tasks and the UI
+keep running, and a cancel still lands while you sleep.
 
-For a timer that has to outlive the tool call that started it, such
-as a toast dismissing itself, use `maki.defer_fn`.
+All plugins share one Lua thread. Code that runs for 5 seconds without
+yielding is stopped with an error. `sleep(0)` lets every other ready
+task run once, then returns. Call it now and then in long loops.
+
+A repeating timer is a sleep loop inside `maki.async.spawn`. For a
+one-shot timer that outlives the tool call, such as a toast that
+dismisses itself, use `maki.defer_fn`.
 
 **Parameters:**
 
-- `{ms}` (`integer`) Milliseconds to sleep.
+- `{ms}` (`integer`) Milliseconds to sleep. Zero only yields.
 
 **Example:**
 
@@ -1581,6 +1635,14 @@ maki.async.run(function()
   maki.async.sleep(4000)
   win:close()
 end)
+
+-- A long loop that keeps the rest of maki responsive:
+for i, line in ipairs(lines) do
+  if i % 1000 == 0 then
+    maki.async.sleep(0)
+  end
+  process(line)
+end
 ```
 
 ---
@@ -1805,6 +1867,23 @@ Give the permit back to the semaphore so another task can acquire it.
 Throws if you already released this permit.
 
 
+## maki.async.Task {#maki-async-Task}
+
+Handle returned by `maki.async.spawn`.
+
+---
+
+### `Task:cancel()` {#Task-cancel}
+
+```lua
+Task:cancel()
+```
+
+Stop the task. A task that is waiting ends right away and runs its
+`maki.async.on_cancel` hooks. A task that cancels itself stops at its
+next yield. Extra calls do nothing.
+
+
 ## maki.base64 {#maki-base64}
 
 Base64 encoding and decoding, modelled after `vim.base64`.
@@ -1849,13 +1928,13 @@ maki.base64.decode({str})
 ```
 
 Decode a Base64-encoded {str} back to its original bytes. Like `vim.base64.decode`.
-Throws if {str} is not valid Base64.
 
 **Parameters:**
 
 - `{str}` (`string|buffer`) Base64-encoded text.
 
-**Returns:** (`string`) Decoded bytes as a string.
+**Returns:** (`string?`, `string?`) Decoded bytes as a string, or nil plus an error
+  message if {str} is not valid Base64.
 
 **Example:**
 
@@ -2018,15 +2097,20 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
     plugin can see. Starting a second job under a live name is an error.
 
-**Returns:** (`integer`) Job id.
+**Returns:** (`integer?`, `string?`) Job id, or nil plus an error message when the
+  process could not start (binary not found, bad `cwd`, redirect file not
+  writable).
 
 **Example:**
 
 ```lua
-local id = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
+local id, err = maki.fn.jobstart({ "rg", "--json", pattern, dir }, {
   on_stdout = function(_, line) print(line) end,
   on_exit = function(_, code) print("exit: " .. code) end,
 })
+if not id then
+  maki.log.warn("rg failed to start: " .. err)
+end
 ```
 
 ---
@@ -2088,14 +2172,14 @@ table with `stdout`, `stderr`, `exit_code`, and `truncated`. A job that
 already exited answers from its captured tail, so `truncated` says
 whether that tail ever lost a line (`tail` too small or 0, or the stream
 redirected away). Waiting on a live job collects every line and is never
-truncated. Returns `nil` if the job does not finish before the timeout.
+truncated.
 
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream
 output into a buffer while parked here. An already-exited
 session-owned job answers from its snapshot and fires no callbacks.
 Task and plugin jobs leave the store on exit, so waiting after that
-is an error.
+answers nil plus an error.
 
 Requires the `run` [plugin permission](#plugin-permissions).
 
@@ -2104,13 +2188,14 @@ Requires the `run` [plugin permission](#plugin-permissions).
 - `{job_id}` (`integer`) Job id returned by `jobstart`.
 - `{timeout_ms?}` (`integer?`) Maximum wait in milliseconds (default 30000).
 
-**Returns:** (`table?`) `{ stdout, stderr, exit_code, truncated }`, or nil on timeout.
+**Returns:** (`table?`, `string?`) `{ stdout, stderr, exit_code, truncated }`, or
+  nil plus an error on timeout or an unknown job.
 
 **Example:**
 
 ```lua
 local id = maki.fn.jobstart("echo hello")
-local result = maki.fn.jobwait(id, 5000)
+local result, err = maki.fn.jobwait(id, 5000)
 if result then
   print(result.stdout)
 end
@@ -2347,8 +2432,7 @@ maki.fs.read({path})
 ```
 
 Read the entire file at {path} as a UTF-8 string.
-Files larger than 512 MiB return nil plus an error message.
-If the file contains bytes that are not valid UTF-8, this function throws.
+Files over 512 MiB or not valid UTF-8 return nil plus an error message.
 Use `read_bytes` for binary files.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
@@ -3633,6 +3717,36 @@ maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
 
 ---
 
+### `maki.model.tier()` {#maki-model-tier}
+
+```lua
+maki.model.tier({name}, {provider?})
+```
+
+The model maki uses for a tier, the same one a subagent asking for that
+tier gets: your pick from the `/model` picker, else the curated default.
+`assigned` tells the two apart. Pass `provider` to prefer its models, the
+way subagents prefer the session's provider.
+
+**Parameters:**
+
+- `{name}` (`string`) `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.
+- `{provider?}` (`string|nil`) Provider slug to resolve within first.
+
+**Returns:** (`table|nil`, `string|nil`) The model in the shape `info` returns, plus
+  `assigned` (boolean), true when you picked it for this tier. nil and nil
+  when no model fits the tier, nil and an error when the spec no longer
+  resolves.
+
+**Example:**
+
+```lua
+local m = maki.model.tier("weak", maki.model.get().provider)
+if m then maki.model.set(m.spec) end
+```
+
+---
+
 ### `maki.model.info()` {#maki-model-info}
 
 ```lua
@@ -3676,15 +3790,19 @@ if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
 
 ## maki.net {#maki-net}
 
-HTTP client for fetching web content. All traffic goes over HTTPS
-(plain HTTP is upgraded). Private and metadata IP addresses are
-blocked to prevent SSRF, including after a redirect. Hosts listed in
-the `net.allowed_private_hosts` config option are exempt, and so is a
-provider plugin's own origin (see `maki.net.request`).
-Failed requests (5xx) are retried automatically.
+HTTP and plain TCP for plugins.
+
+`request` traffic goes over HTTPS (plain HTTP is upgraded). Private
+and metadata IP addresses are blocked to prevent SSRF, including
+after a redirect. Hosts listed in the `net.allowed_private_hosts` config
+option are exempt, and so is a provider plugin's own origin (see
+`maki.net.request`). Failed requests (5xx) are retried automatically.
 
 Requests reuse a pool of clients, so calls to the same host share one
 keep-alive connection rather than pay a fresh handshake each time.
+
+`connect` follows the same rules, but only reaches hosts the plugin
+lists in `net_hosts`.
 
 ```lua
 local res, err = maki.net.request("https://example.com")
@@ -3749,6 +3867,125 @@ else
 end
 ```
 
+---
+
+### `maki.net.connect()` {#maki-net-connect}
+
+```lua
+maki.net.connect({host}, {port}, {opts?})
+```
+
+Open a plain TCP connection to {host}:{port}, such as a dashboard or a
+language server running on your machine. There is no TLS.
+
+The plugin must list the host in `net_hosts`, best with its port
+(`"127.0.0.1:7777"`): unlike `request`, `net = true` alone reaches
+nothing. Private and loopback addresses are blocked like in `request`,
+unless `net.allowed_private_hosts` allows them.
+
+`read` and `write` yield, so a connection that stays open belongs in a
+`maki.async.spawn` task. It closes on `conn:close()`, when the handle is
+garbage collected, and when the plugin unloads.
+
+{opts} fields:
+  `timeout` (integer) Connect timeout in seconds, max 60 (default 10).
+
+Requires the `net` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{host}` (`string`) Host name or IP address.
+- `{port}` (`integer`) Port to connect to.
+- `{opts?}` (`table?`) Options (see above).
+
+**Returns:** ([`maki.net.Conn?`](#maki-net-Conn), `string?`) The connection, or nil plus an error string.
+
+**Example:**
+
+```lua
+maki.async.spawn(function()
+  local conn, err = maki.net.connect("127.0.0.1", 7777)
+  if not conn then return maki.log.error(err) end
+  conn:write("hello\n")
+  while true do
+    local chunk = conn:read()
+    if not chunk then break end
+    handle(chunk)
+  end
+  conn:close()
+end)
+```
+
+
+## maki.net.Conn {#maki-net-Conn}
+
+A TCP connection opened by `maki.net.connect`.
+
+`read` and `write` yield until done and can run at the same time.
+The connection closes on `:close()`, when the handle is garbage
+collected, and when the plugin unloads.
+
+---
+
+### `Conn:read()` {#Conn-read}
+
+```lua
+Conn:read()
+```
+
+Wait for data and return what arrived, at most 64 KiB. Returns
+`nil, nil` once the peer has closed its side.
+
+Only one read at a time: a second `read()` while one is waiting returns
+an error. A read and a write can run at the same time.
+
+**Returns:** (`string?`, `string?`) Bytes read, or nil plus an error string, or nil, nil at end of stream.
+
+**Example:**
+
+```lua
+local chunk, err = conn:read()
+if err then return maki.log.error(err) end
+if not chunk then print("peer closed") end
+```
+
+---
+
+### `Conn:write()` {#Conn-write}
+
+```lua
+Conn:write({data})
+```
+
+Send {data} and wait until all of it is written. Writes made while one
+is in flight wait their turn, so each goes out whole and in call order.
+A write that is cancelled or fails partway closes the connection,
+because the peer would read the next write as the rest of the cut one.
+
+**Parameters:**
+
+- `{data}` (`string`) Bytes to send.
+
+**Returns:** (`boolean?`, `string?`) `true`, or nil plus an error string.
+
+**Example:**
+
+```lua
+local ok, err = conn:write(maki.json.encode(msg) .. "\n")
+if not ok then return maki.log.error(err) end
+```
+
+---
+
+### `Conn:close()` {#Conn-close}
+
+```lua
+Conn:close()
+```
+
+Close the connection. A read or write in flight ends with an error.
+Extra calls do nothing.
+
 
 ## maki.provider {#maki-provider}
 
@@ -3808,19 +4045,50 @@ it does for a built-in provider.
 
 {spec} fields:
   `slug` (string) Required. Letters, digits, `_` and `-`, starting with a
-          letter or digit. Must not be a built-in slug or one defined in
-          `providers.toml`.
+          letter or digit. Must not be a slug Maki ships, one it serves
+          from models.dev, or one defined in `providers.toml`.
   `display_name` (string) Required. Shown in the UI.
   `codec` (string) Wire format: `"openai"`, `"openai-responses"`,
           `"anthropic"` or `"google"`.
   `base` (string) A native provider to borrow whole, e.g. `"ollama"`.
           Prefer `codec` for a new provider.
   `base_url` (string) Default origin. Must be `https`, or `http` on
-          loopback, and its host must match `net_hosts`.
+          loopback, and its host must match `net_hosts`. Only with
+          `codec`. A `base` moves only to an origin the `auth` hook
+          returns, so plans with a `base_url` need a `codec` too.
   `api_key_env` (string) Env var holding the API key, re-read each time
           the provider is built. Sent as `x-api-key` for anthropic,
           `x-goog-api-key` for google, and a bearer token otherwise.
-          Needs the `env` permission.
+          Also lists the provider in `maki auth login`, which saves the
+          key. Needs the `env` permission.
+  `default_model` (string) Model id without the slug, selected after
+          `maki auth login`.
+  `login_url` (string) Page `maki auth login` opens to get a key.
+  `plans` (table) List of `{ key, display_name, base_url, default_model,
+          login_url }` for `maki auth login` to offer. `key` and
+          `display_name` are required. A plan's `base_url` defaults to
+          the provider's and must match `net_hosts`. The choice is saved
+          as `plan` in `providers.toml`.
+  `family` (string) `"generic"`, `"claude"`, `"gpt"`, `"gemini"`,
+          `"glm"` or `"synthetic"`. Applies to models without a row.
+          Defaults to the provider behind `codec` or `base`.
+  `accepts_arbitrary_models` (boolean) Assign tiers to `list_models`
+          results. When false, tiers come only from `models`. This and
+          the next two default to the `base` provider's, or with a
+          `codec` to `true`, `16384` and `128000`.
+  `max_output_tokens` (integer|false) Output cap for rows that leave it
+          out and models without a row. `false` sends no cap.
+  `context_window` (integer) Context window for rows that leave it out
+          and models without a row.
+  `pricing_schedule` (table) Peak-hour pricing, as
+          `{ windows = { { 1, 4 }, ... }, multiplier = 2,
+          weekdays_only = true }`. Windows are `{ start, end }` UTC
+          hours with `end` exclusive. Row `pricing` is the off-peak rate.
+  `aperture` (table) `{ path_prefix = "/v1" }` routes Aperture models
+          of this slug through this provider.
+  `docs` (table) `{ features, discovery_note }` for the generated
+          [Providers](/docs/providers/) page. `discovery_note` replaces
+          the model table when `models` is empty.
   `system_prefix` (string) Text prepended to the system prompt. The
           `google` codec refuses it.
   `openai` (table) Options for `codec = "openai"`, all optional:
@@ -3847,7 +4115,8 @@ it does for a built-in provider.
             `{ header = "x-affinity" }` or `{ body_field = "session_id" }`.
     `thinking_overrides` (table) Model id prefix to `"no"`, `"yes"` or
             `"required"`, overriding the model table. Longest prefix wins.
-  `models` (table) Static model rows, read once at registration. See
+  `models` (table) Static model rows, read once at registration. They
+           describe models and add to the runtime list. See
            [model rows](/docs/providers/#model-rows).
   `auth` (function) `function(ctx, purpose)` returning
            `{ base_url = ..., headers = { ... } }`. `purpose` is
@@ -3855,7 +4124,8 @@ it does for a built-in provider.
            or `"reload"` after a login changed the stored credentials.
            Omitting `base_url` keeps the current one.
   `list_models` (function) `function(ctx)` returning model rows for a
-           catalogue only known at runtime. Rows carry `id`,
+           catalogue only known at runtime. Without it, the provider
+           lists what its codec or base lists. Rows carry `id`,
            `context_window`, `max_output_tokens`, `pricing`,
            `supports_thinking`, `supports_vision` and `tier`, plus two
            optional fields. `extra` is any JSON value, handed back to
@@ -3879,7 +4149,9 @@ it does for a built-in provider.
            `maki auth login`. This `ctx` also has `ctx.print(text)`,
            `ctx.prompt({ label = ..., secret = ... })` and
            `ctx.open_url(url)`.
-  `logout` (function) `function(ctx)`, run by `maki auth logout`.
+  `logout` (function) `function(ctx)`, run by `maki auth logout` before
+           Maki deletes the stored credentials itself. Only needed for
+           work Maki cannot do, such as revoking a token upstream.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
@@ -4033,10 +4305,11 @@ maki.provider.auth.clear("acme")
 ## maki.session {#maki-session}
 
 Host session primitives. The interactive UI can run several sessions
-at once; these functions let plugins list, create, focus, rename, and
-delete them. Session management returns `nil, "no interactive UI
-attached"` without a UI. `notify` instead targets a live agent mailbox
-directly, so it also works under ACP and SDK frontends.
+at once. These functions list, create, focus, rename, and delete them.
+
+Without a UI, most functions return `nil, "no interactive UI attached"`.
+`current` and `read` still work under `maki -p` and the sdk.
+`messages` and `notify` work everywhere, ACP included.
 
 ---
 
@@ -4085,7 +4358,8 @@ local live, err = maki.session.live()
 maki.session.current()
 ```
 
-Returns the id of the currently focused session.
+Returns the id of the focused session. Under `maki -p` and the sdk,
+that is the one session they run.
 
 **Returns:** (`string|nil`, `string|nil`) Session id, or nil and an error.
 
@@ -4153,10 +4427,12 @@ Reads a live session's transcript, oldest first: everything the model has
 been sent so far, tool calls and results included. Read only.
 
 Each message is `{ role, kind, hidden, content }`. `role` is `"user"` or
-`"assistant"`. `kind` is `"turn"` for something the user or the model said
-and `"observation"` for a report sent to the model as a user message, like
-`maki.session.notify`. `hidden` marks a message only the model sees, such
-as a nudge or a compaction note. `content` lists blocks:
+`"assistant"`. `kind` is `"turn"` for something the user or the model said,
+`"observation"` for a report sent to the model as a user message, like
+`maki.session.notify`, and `"context_update"` for a change since the
+system prompt was built (date, model, plan mode, ...). `hidden` marks a
+message only the model sees, such as a nudge or a compaction note.
+`content` lists blocks:
 
 ```text
 { type = "text", text }
@@ -4778,18 +5054,20 @@ maki.treesitter.language.add({lang}, {opts?})
 ```
 
 Registers {lang} for use with tree-sitter.
-Call this to confirm a language grammar is available. Throws if {lang} is unknown.
-Custom grammar paths are not yet supported.
+Call this to confirm a language grammar is available. Like
+`vim.treesitter.language.add`. Custom grammar paths are not yet supported.
 
 **Parameters:**
 
 - `{lang}` (`string`) Language name, e.g. `"rust"`.
 - `{opts?}` (`table?`) Options table (the `path` key is not yet supported).
 
+**Returns:** (`boolean?`, `string?`) `true`, or nil plus an error if {lang} is unknown.
+
 **Example:**
 
 ```lua
-maki.treesitter.language.add("lua")
+if not maki.treesitter.language.add("lua") then return end
 ```
 
 ---
@@ -5717,6 +5995,14 @@ buf:line("hello from my plugin!")
 local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
 ```
 
+Without a UI (`maki -p`, the sdk, ACP), buffers and the text helpers
+still work. The calls that need a screen behave like this:
+
+- `action`, `input`, and `input_edit` return `nil, "no interactive UI attached"`.
+- `open_editor` returns -1.
+- `flash` writes to the log.
+- `open_win`, `set_status_hint`, and `set_window_title` have no effect.
+
 ---
 
 ### `maki.ui.buf()` {#maki-ui-buf}
@@ -5976,9 +6262,8 @@ local t = maki.ui.truncate_text("hello world", 5)
 maki.ui.flash({msg})
 ```
 
-Shows a brief message in the status bar. The message disappears
-after a short time. Good for confirming an action like "copied!"
-or showing a transient warning.
+Shows a short-lived message in the status bar, such as "copied!" or a
+transient warning. Without a UI, the message goes to the log.
 
 **Parameters:**
 
@@ -6017,7 +6302,7 @@ For slash commands rather than keybound actions, see
 
 - `{name}` (`string`) Action name, e.g. `"file_picker"`.
 
-**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error message for an unknown name.
+**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error for an unknown name or a missing UI.
 
 **Example:**
 
@@ -6036,22 +6321,22 @@ end)
 maki.ui.open_editor({path})
 ```
 
-Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
-it to close. This suspends the TUI while the editor is running.
-Returns the editor's exit code so you can check if the user saved.
+Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and suspends the
+TUI until the editor exits. An exit code of 0 does not mean the user
+saved: read the file back to see what changed.
 
 **Parameters:**
 
 - `{path}` (`string`) File to open.
 
-**Returns:** (`integer`) Editor exit code, or -1 if the action could not be dispatched.
+**Returns:** (`integer`) Editor exit code, or -1 if the editor failed to start or there is no UI.
 
 **Example:**
 
 ```lua
 local code = maki.ui.open_editor("/tmp/scratch.lua")
-if code == 0 then
-  maki.ui.flash("File saved")
+if code ~= 0 then
+  maki.ui.flash("editor exited with " .. code)
 end
 ```
 

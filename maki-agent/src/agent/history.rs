@@ -3,9 +3,14 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
+use maki_storage::frame::{LiveFacts, StoredFrame};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::next_epoch;
+use serde_json::Value;
 use tracing::warn;
+
+use super::frame::LiveFrame;
+use crate::mcp::{McpSession, ToolDeferral};
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
@@ -44,6 +49,10 @@ pub struct History {
     /// write is retried by the next turn instead of lost. [`Self::restored`]
     /// leaves it clear: its repair alone is not worth rewriting the file for.
     unsaved: bool,
+    /// The in-memory half of `snapshot.frame`. It sits next to the transcript
+    /// because messages only make sense under the prefix they were sent with,
+    /// and every frontend already keeps a `History` for the whole session.
+    live: Option<LiveFrame>,
 }
 
 impl History {
@@ -52,7 +61,80 @@ impl History {
             snapshot: HistorySnapshot::new(messages),
             mirror: None,
             unsaved: false,
+            live: None,
         }
+    }
+
+    /// Call before [`Self::with_mirror`], which publishes.
+    pub fn with_frame(mut self, frame: Option<Arc<StoredFrame>>) -> Self {
+        self.snapshot.frame = frame;
+        self
+    }
+
+    pub fn frame(&self) -> Option<&Arc<StoredFrame>> {
+        self.snapshot.frame.as_ref()
+    }
+
+    pub(crate) fn live_frame(&self) -> Option<&LiveFrame> {
+        self.live.as_ref()
+    }
+
+    /// What the model holds true: the frame's facts with every update in the
+    /// transcript applied in order. An update from before the frame was built
+    /// still counts, because the model reads it after the prompt.
+    pub(crate) fn told(&self) -> Option<LiveFacts> {
+        let mut facts = self.frame()?.facts_at_start();
+        for update in self.as_slice().iter().filter_map(Message::facts_update) {
+            facts.apply(update);
+        }
+        Some(facts)
+    }
+
+    /// Late MCP tools go into the stored frame too, so a resumed session sends
+    /// the exact same array.
+    pub(crate) fn append_late_tools(&mut self, mcp: &McpSession, deferral: ToolDeferral) {
+        let (Some(live), Some(stored)) = (&mut self.live, &mut self.snapshot.frame) else {
+            return;
+        };
+        let added = live.append_late_tools(mcp, deferral);
+        if added.is_empty() {
+            return;
+        }
+        let mut grown = StoredFrame::clone(stored);
+        grown.mcp_tools.extend_from_slice(added);
+        *stored = Arc::new(grown);
+        self.unsaved = true;
+        self.publish();
+    }
+
+    pub(crate) fn request_prefix(&self) -> Option<(&str, &Value)> {
+        Some((
+            &self.snapshot.frame.as_ref()?.system,
+            &self.live.as_ref()?.wire,
+        ))
+    }
+
+    pub(crate) fn adopt_frame(&mut self, live: LiveFrame) {
+        self.live = Some(live);
+    }
+
+    pub(crate) fn set_frame(&mut self, stored: StoredFrame, live: LiveFrame) {
+        self.live = Some(live);
+        self.snapshot.frame = Some(Arc::new(stored));
+        self.unsaved = true;
+        self.publish();
+    }
+
+    /// For compaction. Once the old messages are summarized, the old prefix
+    /// has nothing left worth keeping, so the next request builds a fresh one.
+    /// Context updates go too: they were changes against the old prompt, and
+    /// the fresh one states them, or they are told again before the next
+    /// request.
+    pub(crate) fn restart(&mut self, mut messages: Vec<Message>) {
+        messages.retain(|m| !m.is_context_update());
+        self.live = None;
+        self.snapshot.frame = None;
+        self.replace(messages);
     }
 
     pub fn restored(mut messages: Vec<Message>) -> Self {
@@ -122,6 +204,21 @@ impl History {
 
     pub fn truncate(&mut self, len: usize) {
         self.rewrite(|msgs| msgs.truncate(len));
+    }
+
+    /// Drops every thinking block, the one edit that leaves later ones valid
+    /// whatever moved under them. Returns how many went.
+    pub(crate) fn strip_thinking(&mut self) -> usize {
+        let thinking = self
+            .as_slice()
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter(|b| b.is_thinking())
+            .count();
+        if thinking > 0 {
+            self.rewrite(|msgs| strip_thinking(msgs));
+        }
+        thinking
     }
 
     pub fn into_vec(self) -> Vec<Message> {
@@ -198,6 +295,12 @@ pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool 
     }
 
     changed
+}
+
+pub(super) fn strip_thinking(messages: &mut [Message]) {
+    for msg in messages {
+        msg.content.retain(|block| !block.is_thinking());
+    }
 }
 
 /// Empty markers and synthetic prompts (empty `display_text`) are

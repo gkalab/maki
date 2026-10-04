@@ -118,6 +118,9 @@ pub struct Google {
     stream_timeout: Duration,
     /// Env / `providers.toml` / inventory default, resolved once at construction.
     resolved_base_url: Option<String>,
+    /// Where a codec caller sends requests when its auth carries no origin.
+    /// Kept out of the auth cell, because an origin there outranks the user's.
+    fallback_base_url: Option<String>,
 }
 
 impl Google {
@@ -131,6 +134,7 @@ impl Google {
             key_pool: Some(pool),
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            fallback_base_url: None,
         })
     }
 
@@ -145,7 +149,22 @@ impl Google {
             key_pool: None,
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            fallback_base_url: None,
         }
+    }
+
+    pub(crate) fn with_fallback_base_url(mut self, base_url: Option<String>) -> Self {
+        self.fallback_base_url = base_url;
+        self
+    }
+
+    fn base_url(&self) -> String {
+        let auth = self.auth.lock().unwrap();
+        auth.base_url
+            .as_deref()
+            .or(self.fallback_base_url.as_deref())
+            .unwrap_or(BASE_URL)
+            .to_string()
     }
 
     fn build_request(&self, method: &str, url: &str) -> isahc::http::request::Builder {
@@ -168,19 +187,13 @@ impl Google {
     }
 
     fn stream_url(&self, model_id: &str) -> String {
-        let base = {
-            let auth = self.auth.lock().unwrap();
-            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
-        };
+        let base = self.base_url();
         let encoded = super::urlenc(model_id);
         format!("{base}/models/{encoded}:streamGenerateContent?alt=sse")
     }
 
     fn models_url(&self) -> String {
-        let base = {
-            let auth = self.auth.lock().unwrap();
-            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
-        };
+        let base = self.base_url();
         let key = self.api_key();
         format!("{base}/models?key={key}&pageSize=1000")
     }
@@ -192,6 +205,7 @@ impl Google {
         system: &str,
         tools: &Value,
         thinking: ThinkingConfig,
+        top_p: Option<f64>,
     ) -> Value {
         let mut body = json!({
             "contents": convert_messages(messages),
@@ -205,6 +219,12 @@ impl Google {
 
         if let Some(max_output) = model.output_tokens() {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output);
+        }
+        // Gemini ignores `topP` on models that dropped sampling params (3.6+)
+        // instead of erroring, and 2.5 thinking models accept it, so unlike
+        // Anthropic and OpenAI it rides along even when thinking is on.
+        if let Some(top_p) = top_p {
+            body["generationConfig"]["topP"] = json!(top_p);
         }
 
         let tool_decls = convert_tools(tools);
@@ -224,7 +244,8 @@ impl Google {
         event_tx: &Sender<ProviderEvent>,
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
-        let body = self.build_body(model, messages, system, tools, thinking);
+        let top_p = self.auth.lock().unwrap().top_p;
+        let body = self.build_body(model, messages, system, tools, thinking, top_p);
         let url = self.stream_url(&model.id);
         let json_body = serde_json::to_vec(&body)?;
 
@@ -293,6 +314,11 @@ impl Provider for Google {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
+            // Credentials handed in through `with_auth` belong to the caller,
+            // and our vendor key must never follow them to a third-party origin.
+            if self.key_pool.is_none() {
+                return Ok(());
+            }
             let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
             *self.auth.lock().unwrap() =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
@@ -674,6 +700,7 @@ async fn parse_sse(
         },
         usage,
         stop_reason,
+        ..Default::default()
     })
 }
 
@@ -771,12 +798,30 @@ mod tests {
             "be helpful",
             &json!([]),
             ThinkingConfig::Off,
+            None,
         );
 
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be helpful");
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 8192);
         assert!(body.get("tools").is_none());
+        assert!(body["generationConfig"].get("topP").is_none());
+    }
+
+    #[test_case(ThinkingConfig::Off ; "without_thinking")]
+    #[test_case(ThinkingConfig::Adaptive ; "with_thinking")]
+    fn google_build_body_sends_top_p(thinking: ThinkingConfig) {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        let messages = vec![Message::user("hello".into())];
+        let body = google.build_body(
+            &test_model(),
+            &messages,
+            "",
+            &json!([]),
+            thinking,
+            Some(0.8),
+        );
+        assert_eq!(body["generationConfig"]["topP"], 0.8);
     }
 
     #[test]
@@ -789,6 +834,7 @@ mod tests {
             "",
             &json!([]),
             ThinkingConfig::Adaptive,
+            None,
         );
 
         assert_eq!(
@@ -807,6 +853,7 @@ mod tests {
             "",
             &json!([]),
             ThinkingConfig::Budget(8192),
+            None,
         );
 
         // Clamped to the model's max thinking budget (half of 8192 output tokens).

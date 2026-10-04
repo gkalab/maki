@@ -159,8 +159,12 @@ fn cli_stack(
     let trust = project::resolve_noninteractive(&cwd, trust_mode);
     load_env_files(&trust.project_config);
 
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
+    let mut host = PluginHost::start(
+        Arc::clone(ToolRegistry::global_arc()),
+        Interaction::None,
+        !no_jit,
+    )
+    .context("initialize lua plugin host")?;
     let (config, warnings) = load_plugins(
         &mut host,
         no_plugins,
@@ -225,7 +229,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Session { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
-                SessionAction::List { global } => session::list(global, &storage)?,
+                SessionAction::List { global, json } => session::list(global, json, &storage)?,
                 SessionAction::Delete { session_id, force } => {
                     session::delete(&session_id, force, &storage)?
                 }

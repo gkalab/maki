@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
-use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
+use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, ToolDeferral, UNKNOWN_MCP, is_wire_name};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
 use crate::tools::registry::{InstalledHook, RegisteredTool, Tool, ToolInvocation};
@@ -27,6 +27,11 @@ use maki_storage::id::SessionRef;
 const DOOM_LOOP_THRESHOLD: usize = 3;
 const DOOM_LOOP_MESSAGE: &str = "You have called this tool with the same (or nearly identical) input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
+/// A frame never drops a tool, so a server that went away, or stopped
+/// publishing one, leaves its names listed. Saying so stops the model from
+/// retrying them.
+const MCP_SERVER_GONE: &str =
+    "Its MCP server is not connected or no longer offers it, so it cannot be called now.";
 const MCP_PERM_SCOPE_MAX_BYTES: usize = 200;
 
 const SOURCE_NATIVE: &str = "native";
@@ -566,13 +571,15 @@ async fn run_inner(
         }
         Route::Unknown => {
             warn!(tool = %name, "unknown tool");
+            let mut text = format!("{UNKNOWN_TOOL_PREFIX}: {name}");
+            if ctx.mcp.is_some() && is_wire_name(name) {
+                text = format!("{text}. {MCP_SERVER_GONE}");
+            }
             ToolDoneEvent {
                 call: None,
                 id,
                 tool: Arc::from(UNKNOWN_MCP),
-                output: Arc::new(ToolOutput::Plain(
-                    format!("{UNKNOWN_TOOL_PREFIX}: {name}").into(),
-                )),
+                output: Arc::new(ToolOutput::Plain(text.into())),
                 is_error: true,
                 annotation: None,
                 written_path: None,
@@ -767,7 +774,8 @@ fn run_tool_search(
     let tool_id: Arc<str> = Arc::from(TOOL_SEARCH_TOOL_NAME);
     let query = input["query"].as_str().unwrap_or_default();
     emit_raw_start(ctx, origin, &id, &tool_id, query.to_owned(), input);
-    let (output, is_error) = match mcp.search_tools(query, origin) {
+    let deferral = ToolDeferral::for_model(&ctx.model);
+    let (output, is_error) = match mcp.search_tools(query, origin, deferral) {
         Ok(found) => (found, false),
         Err(e) => (e.into(), true),
     };
@@ -905,7 +913,7 @@ async fn execute_mcp_tool(
     }
 
     // Only a permitted call loads the tool.
-    let loaded_tools = mcp.load_called(&tool, origin);
+    let loaded_tools = mcp.load_called(&tool, origin, ToolDeferral::for_model(&ctx.model));
     let (text, is_error) = match mcp.call_tool(&tool, input).await {
         Ok(text) => (text, false),
         Err(e) => (e.to_string(), true),
@@ -2459,9 +2467,13 @@ mod tests {
     }
 
     /// The model only fixes names it recognizes, so it hears back what it sent.
-    #[test_case(None, "nonexistent.tool" ; "without_mcp")]
-    #[test_case(Some(PROBE_QUALIFIED), OTHER_WIRE ; "unpublished_wire_name")]
-    fn unknown_tool_errors_and_echoes_the_name_verbatim(published: Option<&str>, name: &str) {
+    #[test_case(None, "nonexistent.tool", false ; "without_mcp")]
+    #[test_case(Some(PROBE_QUALIFIED), OTHER_WIRE, true ; "unpublished_wire_name")]
+    fn unknown_tool_errors_and_echoes_the_name_verbatim(
+        published: Option<&str>,
+        name: &str,
+        server_gone: bool,
+    ) {
         smol::block_on(async {
             let mcp = published.map(|tool| stub_mcp(&[tool]));
             let ctx = match &mcp {
@@ -2474,6 +2486,7 @@ mod tests {
             let text = done.output.as_text();
             assert!(text.starts_with(UNKNOWN_TOOL_PREFIX), "got: {text}");
             assert!(text.contains(name), "got: {text}");
+            assert_eq!(text.contains(MCP_SERVER_GONE), server_gone, "got: {text}");
         });
     }
 

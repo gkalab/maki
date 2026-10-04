@@ -4,6 +4,7 @@ pub(crate) mod image;
 pub(crate) mod manifest;
 pub mod model;
 pub mod model_registry;
+pub mod models_cache;
 pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;
@@ -40,7 +41,8 @@ pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
     ContentBlock, DEFER_LOADING_KEY, EMPTY_RESPONSE_MARKER, Effort, EffortDialect,
     IMAGE_EVICTED_NOTE, IMAGE_OMITTED_NOTE, IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType,
-    ImageSource, Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions,
-    Role, StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, ThinkingFallback, UsageLimit,
-    adapt_images_for_model, dialect, is_deferred_tool,
+    ImageSource, InputTransformation, Message, MessageKind, ModelUsageRow, ProviderEvent,
+    ProviderUsage, RequestOptions, Role, StopReason, StreamResponse, THINKING_USAGE,
+    ThinkingConfig, ThinkingFallback, UsageLimit, adapt_images_for_model, dialect,
+    is_deferred_tool,
 };

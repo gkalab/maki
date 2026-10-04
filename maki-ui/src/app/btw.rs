@@ -34,18 +34,18 @@ impl App {
     ) {
         // The mirror is verbatim, so mid-turn it can end on an open tool call.
         // Providers reject that, so close them off on our own copy.
-        let mut messages = self
-            .shared_history
+        let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
+        let mut messages = snapshot
             .as_ref()
-            .map(|h| Vec::clone(&h.load().messages))
+            .map(|s| Vec::clone(&s.messages))
             .unwrap_or_default();
         maki_agent::close_dangling_tool_calls(&mut messages, maki_agent::UNAVAILABLE_RESULT);
-        let system = self
-            .btw_system
+        // The session's own prompt, so the side question reads the transcript
+        // under the instructions it was written under.
+        let system = snapshot
             .as_ref()
-            .map(|s| String::clone(&s.load()))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| BTW_FALLBACK_SYSTEM.to_string());
+            .and_then(|s| s.frame.as_ref())
+            .map_or_else(|| BTW_FALLBACK_SYSTEM.to_string(), |f| f.system.clone());
         messages.push(btw_question(&question));
 
         let (tx, rx) = flume::bounded(64);

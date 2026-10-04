@@ -234,17 +234,28 @@ table narrows that to an allowlist:
 ```toml
 [permissions]
 net = true
-net_hosts = ["api.acme.com", "*.acme.dev"]
+net_hosts = ["api.acme.com", "*.acme.dev", "127.0.0.1:7777"]
 ```
 
 A pattern is an exact host or a single leading `*.` label. `*.acme.dev` matches
 `api.acme.dev`, and it does not match `acme.dev` or `evilacme.dev`. An empty
 list reaches no host at all, which differs from leaving the key out.
 
+Add `:port` to allow one port only, as in `api.acme.com:443` or
+`*.acme.dev:8443`. Write an IPv6 address in brackets when it has a port, as in
+`[::1]:7777`. A pattern without a port allows every port on that host. Maki
+ignores a pattern it cannot read, such as `acme.com:x` or a bare `*`, and logs a
+warning naming the plugin.
+
 The list covers the plugin's `maki.net` calls and the `base_url` of any
 [provider it registers](/docs/providers/#plugin-providers), so an auth hook
 cannot send credentials to a host the manifest does not name. A plugin that
 calls `maki.provider.register` must declare a non-empty list.
+
+`maki.net.connect` opens raw TCP and only reaches hosts in `net_hosts`, so
+`net = true` alone is not enough for it. Give these entries a port, as in
+`127.0.0.1:7777`. A loopback or LAN address also needs
+`net.allowed_private_hosts`, as described below.
 
 For an installed [package](/docs/packages/#package-permissions), Maki stores
 the hosts with the approval and asks again when an update widens or drops the

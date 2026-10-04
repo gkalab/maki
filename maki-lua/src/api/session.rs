@@ -12,7 +12,7 @@ use serde_json::json;
 
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip, ui_roundtrip};
 use crate::api::util::convert::json_to_lua;
-use crate::api::util::pair::{Pair, err_pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
 /// optional session id from Lua and returns a serialized
@@ -182,7 +182,7 @@ fn message_json(message: &Message) -> serde_json::Value {
             Role::User => "user",
             Role::Assistant => "assistant",
         },
-        "kind": message.kind,
+        "kind": <&'static str>::from(&message.kind),
         "hidden": message.display_text.as_deref() == Some(""),
         "content": content,
     })
@@ -192,10 +192,12 @@ fn message_json(message: &Message) -> serde_json::Value {
 /// been sent so far, tool calls and results included. Read only.
 ///
 /// Each message is `{ role, kind, hidden, content }`. `role` is `"user"` or
-/// `"assistant"`. `kind` is `"turn"` for something the user or the model said
-/// and `"observation"` for a report sent to the model as a user message, like
-/// `maki.session.notify`. `hidden` marks a message only the model sees, such
-/// as a nudge or a compaction note. `content` lists blocks:
+/// `"assistant"`. `kind` is `"turn"` for something the user or the model said,
+/// `"observation"` for a report sent to the model as a user message, like
+/// `maki.session.notify`, and `"context_update"` for a change since the
+/// system prompt was built (date, model, plan mode, ...). `hidden` marks a
+/// message only the model sees, such as a nudge or a compaction note.
+/// `content` lists blocks:
 ///
 /// ```text
 /// { type = "text", text }
@@ -248,14 +250,15 @@ async fn messages(
     Ok((Some(out), None))
 }
 
-/// Returns the id of the currently focused session.
+/// Returns the id of the focused session. Under `maki -p` and the sdk,
+/// that is the one session they run.
 ///
 /// @return (string|nil, string|nil) Session id, or nil and an error.
 /// @example
 /// local id = maki.session.current()
 #[lua_fn]
-async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
-    roundtrip(lua, tx, SessionRequest::Current).await
+async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<String>> {
+    Ok(pair(focused_session(&lua, tx.as_ref()).await))
 }
 
 /// Switches the UI to the session with {id}.
@@ -415,10 +418,11 @@ async fn set_title(
 
 lua_table! {
     /// Host session primitives. The interactive UI can run several sessions
-    /// at once; these functions let plugins list, create, focus, rename, and
-    /// delete them. Session management returns `nil, "no interactive UI
-    /// attached"` without a UI. `notify` instead targets a live agent mailbox
-    /// directly, so it also works under ACP and SDK frontends.
+    /// at once. These functions list, create, focus, rename, and delete them.
+    ///
+    /// Without a UI, most functions return `nil, "no interactive UI attached"`.
+    /// `current` and `read` still work under `maki -p` and the sdk.
+    /// `messages` and `notify` work everywhere, ACP included.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
     DOCS [list(tx), live(tx), current(tx), read(tx), messages(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx)]
 }
@@ -688,6 +692,17 @@ mod tests {
 
     #[test_case(headless_focused_on ; "headless_snapshot_id")]
     #[test_case(ui_focused_on ; "ui_current_bare_id")]
+    fn current_names_the_focused_session(focused_on: fn(MakiId) -> Lua) {
+        let id = MakiId::generate();
+        let lua = focused_on(id);
+        let (got, err): (Option<String>, Option<String>) =
+            smol::block_on(lua.load("return session.current()").eval_async()).unwrap();
+        assert_eq!(err, None);
+        assert_eq!(got, Some(id.to_string()));
+    }
+
+    #[test_case(headless_focused_on ; "headless_snapshot_id")]
+    #[test_case(ui_focused_on ; "ui_current_bare_id")]
     fn messages_defaults_to_the_focused_session(focused_on: fn(MakiId) -> Lua) {
         let id = MakiId::generate();
         let _history = live(id, vec![Message::user(FOCUSED_TEXT.into())]);
@@ -759,6 +774,7 @@ mod tests {
     #[test_case(Role::User, MessageKind::Turn, None, "user", "turn", false ; "user_turn_is_visible")]
     #[test_case(Role::User, MessageKind::Observation, Some(""), "user", "observation", true ; "blank_display_text_is_hidden")]
     #[test_case(Role::Assistant, MessageKind::Turn, Some(TEXT), "assistant", "turn", false ; "display_text_with_content_is_visible")]
+    #[test_case(Role::User, MessageKind::ContextUpdate(Default::default()), Some(TEXT), "user", "context_update", false ; "context_update_kind_is_a_plain_name")]
     fn message_json_reports_role_kind_and_hidden(
         role: Role,
         kind: MessageKind,

@@ -5,6 +5,7 @@ use maki_agent::agent::{self, AgentHooks};
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
+use maki_agent::prompt::ResolvedSlots;
 use maki_agent::session::Resumed;
 use maki_agent::template;
 use maki_agent::template::Vars;
@@ -22,7 +23,7 @@ use tracing::error;
 
 use super::ModelSlot;
 use super::run_cancels::RunCancels;
-use super::shared_queue::{self, QueueReceiver, QueueRun};
+use super::shared_queue::{self, Compaction, QueueReceiver, QueueRun};
 
 fn base_tools(
     vars: &Vars,
@@ -53,7 +54,6 @@ pub(super) struct AgentLoop {
     /// Owned beside `history` because it describes that transcript and outlives
     /// every run over it, so the provider's own counts pile up between turns.
     gauge: ContextGauge,
-    btw_system: Arc<ArcSwap<String>>,
     cancels: Arc<RunCancels>,
     permissions: Arc<PermissionManager>,
     file_access: Arc<FileAccess>,
@@ -76,7 +76,6 @@ impl AgentLoop {
         tool_output_lines: ToolOutputLines,
         resumed: Resumed,
         shared_history: SharedMessages,
-        btw_system: Arc<ArcSwap<String>>,
         mcp_handle: Option<McpHandle>,
         permissions: Arc<PermissionManager>,
         agent_tx: flume::Sender<Envelope>,
@@ -98,9 +97,10 @@ impl AgentLoop {
             vars: Vars::default(),
             instructions: Instructions::default(),
             mcp,
-            history: History::restored(resumed.history).with_mirror(shared_history),
+            history: History::restored(resumed.history)
+                .with_frame(resumed.frame)
+                .with_mirror(shared_history),
             gauge: ContextGauge::restored(resumed.context_size),
-            btw_system,
             cancels,
             permissions,
             file_access: FileAccess::fresh(),
@@ -163,8 +163,7 @@ impl AgentLoop {
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
         match run {
             QueueRun::Compact(compaction) => {
-                self.do_compact(&event_tx, compaction.instructions.as_deref(), cancel)
-                    .await?;
+                self.do_compact(&event_tx, &compaction, cancel).await?;
             }
             QueueRun::Messages(messages) => {
                 let inputs = messages
@@ -197,7 +196,6 @@ impl AgentLoop {
         if teardown.is_cancelled() {
             return false;
         }
-        self.publish_btw_system(&maki_agent::prompt::ResolvedSlots::default());
 
         if let Some(ref mcp) = self.mcp {
             // The queue is drained right after this, and a prompt typed during
@@ -210,12 +208,35 @@ impl AgentLoop {
         !teardown.is_cancelled()
     }
 
+    /// What a run would start with now. Every run and `/compact` take it from
+    /// here, so the frame a compaction leaves behind is the one the next run
+    /// keeps, not a near copy that costs it the cache.
+    async fn context_builder(&mut self) -> (RunContextBuilder, Arc<ResolvedSlots>) {
+        let old_cwd = self.vars.apply("{cwd}").into_owned();
+        self.vars = template::env_vars();
+        if *self.vars.apply("{cwd}") != old_cwd {
+            self.reload_instructions().await;
+        }
+        let prompt_slots = Arc::new(self.lua_handle.collect_prompt_slots_async().await);
+        let vars = self.vars.clone();
+        let instructions = self.instructions.text.clone();
+        let slots = Arc::clone(&prompt_slots);
+        let config = self.config.clone();
+        let has_mcp = self.mcp.is_some();
+        let context: RunContextBuilder = Arc::new(move |model, workflow| {
+            let tools = base_tools(&vars, model, &config, has_mcp, workflow);
+            RunContext::render(&vars, &instructions, &slots, model, tools)
+        });
+        (context, prompt_slots)
+    }
+
     async fn do_compact(
         &mut self,
         event_tx: &EventSender,
-        instructions: Option<&str>,
+        compaction: &Compaction,
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
+        let (context, _) = self.context_builder().await;
         let slot = self.model_slot.load();
         let (provider, model) = agent::resolve_compaction_model(
             &slot.provider,
@@ -223,13 +244,9 @@ impl AgentLoop {
             self.timeouts,
             &self.model_policy,
         );
-        // Compaction resizes the gauge, and the gauge has to describe the whole
-        // next prompt. A standalone `/compact` has no mode of its own, so this
-        // is the same Build-mode prompt `publish_btw_system` builds from the
-        // vars, instructions and slots a run would use.
-        let system = self.system_prompt(&self.lua_handle.collect_prompt_slots_async().await);
-        let base = base_tools(&self.vars, &model, &self.config, self.mcp.is_some(), false);
-        let tools = agent::request_tools(&base, self.mcp.as_ref(), &model);
+        // The summary goes out under a fresh frame for the session's own model,
+        // so the gauge and `/btw` read the prompt the next run sends.
+        let next = context(&slot.model, compaction.workflow);
         let hooks = AgentHooks {
             registry: ToolRegistry::global(),
             session_id: Some(&self.session_id),
@@ -243,12 +260,12 @@ impl AgentLoop {
             &model,
             &mut self.history,
             &mut self.gauge,
-            &system,
-            &tools,
+            next,
+            self.mcp.as_ref(),
             event_tx,
             &hooks,
             &self.config,
-            instructions,
+            compaction.instructions.as_deref(),
             self.timeouts.retry,
         )
         .await
@@ -260,11 +277,7 @@ impl AgentLoop {
         event_tx: EventSender,
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
-        let old_cwd = self.vars.apply("{cwd}").into_owned();
-        self.vars = template::env_vars();
-        if *self.vars.apply("{cwd}") != old_cwd {
-            self.reload_instructions().await;
-        }
+        let (context, prompt_slots) = self.context_builder().await;
 
         if let Some(ref prompt_ref) = input.prompt {
             let Some(ref mcp) = self.mcp else {
@@ -294,22 +307,10 @@ impl AgentLoop {
             }
         }
 
-        let prompt_slots = Arc::new(self.lua_handle.collect_prompt_slots_async().await);
-        let vars = self.vars.clone();
-        let instructions = self.instructions.text.clone();
-        let slots = Arc::clone(&prompt_slots);
-        let config = self.config.clone();
-        let has_mcp = self.mcp.is_some();
-        let run_builder: RunContextBuilder = Arc::new(move |model, mode, workflow| RunContext {
-            system: agent::build_system_prompt(&vars, mode, &instructions, &slots, model),
-            tools: base_tools(&vars, model, &config, has_mcp, workflow),
-        });
         // Read after the awaits above, not before: a switch can land while the
-        // run is still starting up, and prompt, tools and request all have to
+        // run is still starting up, and the frame and the request both have to
         // name the model that is current now.
         let slot = self.model_slot.load();
-        let RunContext { system, tools } = run_builder(&slot.model, &input.mode, input.workflow);
-        self.publish_btw_system(&prompt_slots);
 
         while self.answer_rx.lock().await.try_recv().is_ok() {}
 
@@ -335,16 +336,15 @@ impl AgentLoop {
             AgentRunParams {
                 history: &mut self.history,
                 gauge: &mut self.gauge,
-                system,
                 event_tx,
-                tools,
+                context,
             },
         )
         .with_loaded_instructions(self.instructions.loaded.clone())
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
         .with_cancel(cancel.clone())
-        .with_model_sync(Arc::clone(&self.model_slot), run_builder)
+        .with_model_sync(Arc::clone(&self.model_slot))
         .with_mcp(self.mcp.clone());
 
         let result = agent.run(input).await;
@@ -355,24 +355,6 @@ impl AgentLoop {
     async fn reload_instructions(&mut self) {
         let cwd = self.vars.apply("{cwd}").into_owned();
         self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
-    }
-
-    fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
-        self.btw_system
-            .store(Arc::new(self.system_prompt(prompt_slots)));
-    }
-
-    /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
-    /// the model, and a gauge sizing this only cares about the length. Everything else matches
-    /// the live prompt.
-    fn system_prompt(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) -> String {
-        agent::build_system_prompt(
-            &self.vars,
-            &maki_agent::AgentMode::Build,
-            &self.instructions.text,
-            prompt_slots,
-            &self.model_slot.load().model,
-        )
     }
 
     fn emit_error(&self, run_id: u64, error: AgentError) {

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agent_client_protocol_schema::{
+use agent_client_protocol_schema::v1::{
     Content, ContentBlock, ContentChunk, Cost, Diff, ImageContent, SessionUpdate, StopReason,
     TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
     ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
@@ -384,7 +384,7 @@ pub fn replay_history(messages: &[Message], cwd: &Path, home: Option<&Path>) -> 
 }
 
 fn replay_user(msg: &Message, updates: &mut Vec<SessionUpdate>) {
-    if msg.is_observation() {
+    if msg.is_from_host() {
         return;
     }
     if let Some(text) = msg.user_text() {
@@ -495,6 +495,9 @@ mod tests {
     const ABS_PATH: &str = "/home/user/project/src/main.rs";
     const OLD_TEXT: &str = "fn main() {}\n";
     const NEW_TEXT: &str = "fn main() { run() }\n";
+    const MONITOR_NOTE: &str = "[monitor] build failed";
+    const CONTEXT_UPDATE_TEXT: &str = "<context-update>date: tomorrow</context-update>";
+    const CONTEXT_UPDATE_SUMMARY: &str = "Date changed";
 
     #[test_case("1: mod render\n2: mod segment", "```\n1: mod render\n2: mod segment\n```" ; "plain_text_gets_default_fence")]
     #[test_case("has ```rust\ncode\n``` inside", "````\nhas ```rust\ncode\n``` inside\n````" ; "fence_longer_than_inner_backticks")]
@@ -588,10 +591,16 @@ mod tests {
         assert!(updates_json(&[Message::synthetic("injected".into())]).is_empty());
     }
 
-    #[test]
-    fn replay_never_speaks_an_observation_as_the_user() {
-        let obs = Message::observation("[monitor] build failed".into());
-        assert!(updates_json(&[obs]).is_empty());
+    #[test_case(Message::observation(MONITOR_NOTE.into()) ; "observation")]
+    #[test_case(
+        Message::context_update(
+            CONTEXT_UPDATE_TEXT.into(),
+            CONTEXT_UPDATE_SUMMARY.into(),
+            Default::default(),
+        ) ; "context_update"
+    )]
+    fn replay_never_speaks_host_text_as_the_user(msg: Message) {
+        assert!(updates_json(&[msg]).is_empty());
     }
 
     #[test]

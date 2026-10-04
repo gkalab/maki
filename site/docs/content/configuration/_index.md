@@ -66,7 +66,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
 | `always_fast` | bool | `false` | Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere) |
 | `always_workflow` | bool | `false` | Start every session with workflow mode (task callable inside code_execution) |
-| `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
+| `always_thinking` | bool \| string | `none` | Pin the thinking level of every new session: true/"adaptive", false/"off", "minimal" to "max", or a token budget. Unset, new sessions start at the last `/thinking` level |
 
 ### `ui`
 
@@ -92,6 +92,8 @@ Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppucci
 You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.
 
 Diff signs use `diff_old_sign` and `diff_new_sign`, which default to `diff_old` and `diff_new`. These styles are applied after `code_block`, so their properties take precedence. Diff gutters use `diff_old_line_nr` and `diff_new_line_nr`, which default to `diff_line_nr`.
+
+The input caret uses `cursor` when the terminal has focus and `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults to `cursor`, so themes only need it when the two should differ. Terminals that do not report focus events keep the focused caret.
 
 Themes use 24-bit colors by default, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
 

@@ -20,7 +20,8 @@ use maki_agent::tools::{
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
     EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, InputSource, McpSession,
-    RunLedger, SessionEvents, SubagentInbox, SubagentInfo, ToolDoneEvent, event_stream,
+    RunContext, RunContextBuilder, RunLedger, SessionEvents, SubagentInbox, SubagentInfo,
+    ToolDoneEvent, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -603,6 +604,9 @@ async fn session(
     // the caller left out is also a name this session cannot dispatch or bind
     // inside its sandbox.
     let tools = RequestTools::assembled(tools_json, &agent_ctx.config, &model);
+    let system = system.unwrap_or_default();
+    let context: RunContextBuilder =
+        Arc::new(move |_, _| RunContext::fixed(system.clone(), tools.clone()));
 
     let state = SessionState {
         params: AgentParams {
@@ -627,8 +631,7 @@ async fn session(
             audience,
             model_policy: Arc::clone(&agent_ctx.model_policy),
         },
-        system: system.unwrap_or_default(),
-        tools,
+        context,
         opts,
         mcp: agent_ctx
             .mcp
@@ -749,8 +752,8 @@ async fn dispatch_racing_live(
 
 struct SessionState {
     params: AgentParams,
-    system: String,
-    tools: RequestTools,
+    /// The caller's prompt and tools, fixed for the session's life.
+    context: RunContextBuilder,
     /// Already reconciled against `params.model`, so every reader agrees.
     opts: RequestOptions,
     /// Fresh per session so `tool_search` loads never leak between a
@@ -882,9 +885,8 @@ async fn prompt(
         AgentRunParams {
             history: &mut s.history,
             gauge: &mut s.gauge,
-            system: s.system.clone(),
             event_tx: s.sub_event_tx.clone(),
-            tools: s.tools.clone(),
+            context: Arc::clone(&s.context),
         },
     )
     .with_user_response_rx(Arc::clone(&s.answer_rx))

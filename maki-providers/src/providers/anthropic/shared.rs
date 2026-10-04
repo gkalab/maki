@@ -3,15 +3,15 @@ use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
 use flume::Sender;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
-use crate::types::is_deferred_tool;
+use crate::types::{is_deferred_tool, rejects_sampling};
 use crate::{
-    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, Message, ProviderEvent, Role, StopReason,
-    StreamResponse, ThinkingConfig, TokenUsage,
+    AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, Message, ProviderEvent,
+    Role, StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
@@ -84,10 +84,33 @@ impl From<Usage> for TokenUsage {
     }
 }
 
+/// Skips entries of a shape this build doesn't know. The field is in beta, and
+/// failing the whole event over it would lose its usage and stop reason too.
+fn lenient_transformations<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<InputTransformation>>, D::Error> {
+    let Value::Array(entries) = Value::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let parsed = entries
+        .into_iter()
+        .filter_map(|entry| {
+            InputTransformation::deserialize(&entry)
+                .inspect_err(
+                    |e| warn!(error = %e, %entry, "skipping unparseable input transformation"),
+                )
+                .ok()
+        })
+        .collect();
+    Ok(Some(parsed))
+}
+
 #[derive(Deserialize)]
 struct MessagePayload {
     #[serde(default)]
     usage: Option<Usage>,
+    #[serde(default, deserialize_with = "lenient_transformations")]
+    input_transformations: Option<Vec<InputTransformation>>,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +164,9 @@ struct MessageDeltaEvent {
     delta: Option<MessageDeltaPayload>,
     #[serde(default)]
     usage: Option<Usage>,
+    /// Only after a server-side fallback, with the serving model's entries.
+    #[serde(default, deserialize_with = "lenient_transformations")]
+    input_transformations: Option<Vec<InputTransformation>>,
 }
 
 #[derive(Serialize)]
@@ -189,9 +215,14 @@ fn deferred_tool_names(tools: &Value) -> HashSet<&str> {
 /// server was up degrades to text once that server is gone. And it refuses
 /// a `tool_result` mixing references with anything else, so the text is
 /// displaced to a sibling block.
+///
+/// Each name is referenced once per request, by the first result that loaded
+/// it. Every later call records the load again so compaction cannot drop the
+/// only reference, but referencing it each time would pull every later
+/// output out of its own result, leaving the model to pair them by order.
 fn wire_block<'a>(
     block: &'a ContentBlock,
-    deferred: &HashSet<&str>,
+    unreferenced: &mut HashSet<&str>,
 ) -> (WireBlock<'a>, Option<&'a str>) {
     let ContentBlock::ToolResult {
         tool_use_id,
@@ -212,7 +243,7 @@ fn wire_block<'a>(
     };
     let refs: Vec<Value> = loaded_tools
         .iter()
-        .filter(|name| deferred.contains(name.as_str()))
+        .filter(|name| unreferenced.remove(name.as_str()))
         .map(|name| json!({"type": "tool_reference", "tool_name": name}))
         .collect();
     let (parts, displaced) = if refs.is_empty() {
@@ -250,7 +281,10 @@ fn is_replayable(block: &ContentBlock) -> bool {
 /// A message left with no block at all is rejected too, so it falls back to
 /// the marker. Displaced texts go after every result, since the API wants
 /// all `tool_result` blocks first.
-fn wire_content<'a>(msg: &'a Message, deferred: &HashSet<&str>) -> Vec<WireContentBlock<'a>> {
+fn wire_content<'a>(
+    msg: &'a Message,
+    unreferenced: &mut HashSet<&str>,
+) -> Vec<WireContentBlock<'a>> {
     let plain = |inner| WireContentBlock {
         inner,
         cache_control: None,
@@ -261,7 +295,7 @@ fn wire_content<'a>(msg: &'a Message, deferred: &HashSet<&str>) -> Vec<WireConte
         .iter()
         .filter(|block| is_replayable(block))
         .map(|block| {
-            let (inner, text) = wire_block(block, deferred);
+            let (inner, text) = wire_block(block, unreferenced);
             displaced.extend(text);
             plain(inner)
         })
@@ -282,12 +316,12 @@ fn wire_content<'a>(msg: &'a Message, deferred: &HashSet<&str>) -> Vec<WireConte
 /// that protocol must go through it. `tools` must be the request's own
 /// array: it decides which recorded loads may replay as references.
 pub(crate) fn wire_messages<'a>(messages: &'a [Message], tools: &Value) -> Vec<WireMessage<'a>> {
-    let deferred = deferred_tool_names(tools);
+    let mut unreferenced = deferred_tool_names(tools);
     messages
         .iter()
         .map(|msg| WireMessage {
             role: &msg.role,
-            content: wire_content(msg, &deferred),
+            content: wire_content(msg, &mut unreferenced),
         })
         .collect()
 }
@@ -335,6 +369,7 @@ pub(crate) fn build_request_body_with_system(
     system_blocks: &[SystemBlock<'_>],
     tools: &Value,
     thinking: ThinkingConfig,
+    top_p: Option<f64>,
 ) -> Value {
     let wire_messages = build_wire_messages(messages, tools);
     let wire_tools = build_wire_tools(tools);
@@ -345,6 +380,12 @@ pub(crate) fn build_request_body_with_system(
         "messages": wire_messages,
         "tools": wire_tools,
     });
+    if let Some(top_p) = top_p
+        && !thinking.is_enabled()
+        && !rejects_sampling(&model.id)
+    {
+        body["top_p"] = json!(top_p);
+    }
 
     thinking.apply_to_body(&mut body, model);
     body
@@ -356,6 +397,7 @@ pub(super) struct EventParser {
     current_block_idx: usize,
     usage: TokenUsage,
     stop_reason: Option<StopReason>,
+    input_transformations: Vec<InputTransformation>,
 }
 
 impl EventParser {
@@ -366,6 +408,7 @@ impl EventParser {
             current_block_idx: 0,
             usage: TokenUsage::default(),
             stop_reason: None,
+            input_transformations: Vec::new(),
         }
     }
 
@@ -377,10 +420,13 @@ impl EventParser {
     ) -> Result<ControlFlow<(), ()>, AgentError> {
         match event_type {
             "message_start" => {
-                if let Ok(ev) = serde_json::from_str::<MessageStartEvent>(data)
-                    && let Some(u) = ev.message.usage
-                {
-                    self.usage = TokenUsage::from(u);
+                if let Ok(ev) = serde_json::from_str::<MessageStartEvent>(data) {
+                    if let Some(u) = ev.message.usage {
+                        self.usage = TokenUsage::from(u);
+                    }
+                    if let Some(t) = ev.message.input_transformations {
+                        self.input_transformations = t;
+                    }
                 }
             }
             "content_block_start" => match serde_json::from_str::<ContentBlockStartEvent>(data) {
@@ -492,6 +538,9 @@ impl EventParser {
                             }
                         }
                     }
+                    if let Some(t) = ev.input_transformations {
+                        self.input_transformations = t;
+                    }
                     if let Some(d) = ev.delta {
                         self.stop_reason = d
                             .stop_reason
@@ -524,17 +573,29 @@ impl EventParser {
             },
             usage: self.usage,
             stop_reason: self.stop_reason,
+            input_transformations: self.input_transformations,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::{
-        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, long_context_window, strip_long_context,
+        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, SystemBlock, build_request_body_with_system,
+        long_context_window, strip_long_context,
     };
+    use crate::model::{Model, ModelFamily, ModelPricing, ModelTier};
+    use crate::{ContentBlock, Message, Role, ThinkingConfig};
+
+    const SYSTEM: &str = "sys";
+    const TOOL_USE_ID: &str = "toolu_1";
+    const TOOL_SEARCH: &str = "tool_search";
+    const LOADED_TOOL: &str = "srv__fetch";
 
     #[test_case("claude-opus-4-8-1m", "claude-opus-4-8" ; "strips_suffix")]
     #[test_case("claude-opus-4-8", "claude-opus-4-8" ; "leaves_plain_id")]
@@ -547,5 +608,133 @@ mod tests {
     fn long_context_window_follows_suffix(model_id: &str, expected: Option<u32>) {
         assert_eq!(long_context_window(model_id), expected);
         assert!(LONG_CONTEXT_SUFFIX.ends_with("1m"));
+    }
+
+    fn test_model() -> Model {
+        Model {
+            id: "claude-test".into(),
+            provider: Arc::<str>::from("anthropic"),
+            tier: ModelTier::Medium,
+            family: ModelFamily::Claude,
+            supports_tool_examples_override: None,
+            thinking_override: None,
+            supports_vision_override: None,
+            supports_fast_override: None,
+            pricing: ModelPricing::default(),
+            subsidised_by: None,
+            discovered_free: false,
+            max_output_tokens: Some(8192),
+            turn_output_tokens: None,
+            context_window: 200_000,
+            thinking_fields: None,
+        }
+    }
+
+    #[test_case("claude-test", ThinkingConfig::Off, true ; "off_sends_top_p")]
+    #[test_case("claude-test", ThinkingConfig::Adaptive, false ; "thinking_omits_top_p")]
+    #[test_case("claude-opus-4-7", ThinkingConfig::Off, false ; "adaptive_only_model_omits_top_p")]
+    fn top_p_is_sent_unless_thinking_or_adaptive_only(
+        model_id: &str,
+        thinking: ThinkingConfig,
+        sent: bool,
+    ) {
+        let model = Model {
+            id: model_id.into(),
+            ..test_model()
+        };
+        let body = build_request_body_with_system(
+            &model,
+            &[Message::user("hi".into())],
+            &[SystemBlock {
+                r#type: "text",
+                text: "sys",
+                cache_control: None,
+            }],
+            &json!([]),
+            thinking,
+            Some(0.8),
+        );
+        assert_eq!(body.get("top_p") == Some(&json!(0.8)), sent);
+    }
+
+    fn strip_cache_control(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.remove("cache_control");
+                map.values_mut().for_each(strip_cache_control);
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip_cache_control),
+            _ => {}
+        }
+    }
+
+    fn encode(messages: &[Message], tools: &Value) -> Value {
+        let mut body = build_request_body_with_system(
+            &test_model(),
+            messages,
+            &[SystemBlock {
+                r#type: "text",
+                text: SYSTEM,
+                cache_control: None,
+            }],
+            tools,
+            ThinkingConfig::Adaptive,
+            None,
+        );
+        strip_cache_control(&mut body);
+        body
+    }
+
+    /// Cache breakpoints move every turn and the cache ignores them. Everything
+    /// else must come back unchanged at the front of the next request, signed
+    /// thinking and replayed tool loads included, even after a late tool joined.
+    #[test]
+    fn encoded_request_is_a_prefix_of_the_next() {
+        let deferred = |name: &str| json!({"name": name, "defer_loading": true});
+        let tools = json!([{"name": "read"}, deferred(LOADED_TOOL)]);
+        let mut messages = vec![
+            Message::user("go".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "plan".into(),
+                        signature: Some("sig".into()),
+                    },
+                    ContentBlock::tool_use(TOOL_USE_ID, TOOL_SEARCH, json!({})),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: TOOL_USE_ID.into(),
+                    content: String::new(),
+                    is_error: false,
+                    loaded_tools: vec![LOADED_TOOL.into()],
+                }],
+                ..Default::default()
+            },
+        ];
+        let before = encode(&messages, &tools);
+
+        let mut grown_tools = tools.clone();
+        grown_tools.as_array_mut().unwrap().push(deferred("late"));
+        messages.push(Message::context_update(
+            "date".into(),
+            "date".into(),
+            Default::default(),
+        ));
+        messages.push(Message::user("more".into()));
+        let after = encode(&messages, &grown_tools);
+
+        assert_eq!(before["system"], after["system"]);
+        for key in ["tools", "messages"] {
+            let (before, after) = (
+                before[key].as_array().unwrap(),
+                after[key].as_array().unwrap(),
+            );
+            assert_eq!(&after[..before.len()], before.as_slice(), "{key}");
+        }
     }
 }

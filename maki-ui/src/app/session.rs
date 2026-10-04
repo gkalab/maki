@@ -120,7 +120,7 @@ impl App {
     /// and an empty `Vec` does not allocate.
     fn build_meta(&self) -> SessionMeta {
         let state = &self.state;
-        let draft = self.input_box.buffer.value();
+        let draft = self.main_draft();
         SessionMeta {
             mode: Some(state.mode.into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
@@ -171,6 +171,8 @@ impl App {
     /// Call only once `state.session` is final: the chats it builds are
     /// stamped with that session for life.
     pub(super) fn reset_ui_chrome(&mut self) {
+        // Brings the main draft back to the box before the chats holding it go.
+        self.set_active_chat(0);
         self.chats.clear();
         let mut main = Chat::new(
             self.state.session.id,

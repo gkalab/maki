@@ -151,11 +151,15 @@ fn build_stack(
     fallback: Option<(Config, Model)>,
 ) -> Result<(Stack, Vec<String>)> {
     let cli = launch.cli;
-    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
-        .context("initialize lua plugin host")?;
+    let mut plugin_host = PluginHost::start(
+        Arc::clone(ToolRegistry::global_arc()),
+        launch.interaction,
+        !cli.no_jit,
+    )
+    .context("initialize lua plugin host")?;
 
     let (fallback_config, fallback_model) = fallback.unzip();
-    let (config, mut warnings) = super::load_plugins(
+    let (mut config, mut warnings) = super::load_plugins(
         &mut plugin_host,
         cli.no_plugins,
         if fallback_model.is_some() {
@@ -178,9 +182,9 @@ fn build_stack(
         },
     )?;
 
-    warnings.extend(provider_scripts::startup_warning());
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
+    setup::remember_thinking(&mut config.session_defaults, launch.storage);
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok((m, warning)), _) => {
@@ -375,7 +379,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
     // mode that never opens the UI has to report them here or a broken
     // package fails in complete silence.
     if cli.is_sdk_mode() || cli.print {
-        for warning in &startup_warnings {
+        for warning in startup_warnings
+            .iter()
+            .chain(&provider_scripts::startup_warning())
+        {
             eprintln!("warning: {warning}");
         }
     }
@@ -472,6 +479,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 focused,
                 startup_warnings: std::mem::take(&mut warnings),
                 startup_notice: notice.take(),
+                // Read per run: plugins have just (re)loaded, and a script one
+                // of them now replaces is no longer worth a word.
+                startup_alert: provider_scripts::startup_warning(),
                 storage: storage.clone(),
                 config: stack.config.agent.clone(),
                 ui_config: stack.config.ui.clone(),
@@ -701,7 +711,7 @@ mod tests {
         let cli = Cli::parse_from(["maki", "--no-plugins"]);
         assert!(cli.no_plugins);
 
-        let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
+        let mut plugin_host = PluginHost::new(Arc::new(ToolRegistry::new()))
             .expect("live host boots under --no-plugins");
 
         let config = load_config(
@@ -743,7 +753,7 @@ mod tests {
         assert!(!cli.no_plugins);
 
         let mut plugin_host =
-            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
+            PluginHost::new(Arc::new(ToolRegistry::new())).expect("live host boots");
 
         match load_config(
             &plugin_host,

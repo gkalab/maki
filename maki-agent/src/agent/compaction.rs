@@ -10,9 +10,11 @@ use maki_providers::{
 use serde_json::{Value, json};
 use tracing::info;
 
-use super::history::{History, remove_orphaned_tool_results};
+use super::frame::{RunContext, fit_frame};
+use super::history::{History, remove_orphaned_tool_results, strip_thinking};
 use super::hook::{AgentHooks, AgentSlot};
 use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
+use crate::mcp::McpSession;
 use crate::prompt::COMPACTION_USER;
 use crate::tools::hook::Verdict;
 use crate::tools::truncate_bytes;
@@ -169,6 +171,14 @@ pub(super) fn continue_message(config: &AgentConfig, added: Option<&str>) -> Str
     }
 }
 
+pub(super) struct Compacted {
+    pub usage: TokenUsage,
+    pub summary: String,
+    /// How many unanswered messages follow the summary. Context updates are
+    /// never among them, see [`History::restart`].
+    pub carried: usize,
+}
+
 /// Replaces `history` with a summary of itself, retrying on overflow by
 /// pruning what it sends.
 ///
@@ -187,7 +197,7 @@ pub(super) async fn compact_history(
     instructions: Option<&str>,
     carry_len: usize,
     retry: RetryPolicy,
-) -> Result<(TokenUsage, String), AgentError> {
+) -> Result<Compacted, AgentError> {
     let compact_start = std::time::Instant::now();
     let summarized = history.len().saturating_sub(carry_len);
     let mut compaction_history: Vec<Message> = history.as_slice()[..summarized].to_vec();
@@ -261,7 +271,7 @@ fn finish_compact(
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
-) -> Result<(TokenUsage, String), AgentError> {
+) -> Result<Compacted, AgentError> {
     let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: response.message.clone(),
         usage: response.usage,
@@ -282,21 +292,26 @@ fn finish_compact(
         Message::user("What did we do so far?".into()),
         response.message,
     ];
+    let summary_len = new_history.len();
     new_history.extend_from_slice(&history.as_slice()[summarized..]);
-    history.replace(new_history);
+    history.restart(new_history);
     info!(
         model = %model.id,
         duration_ms = compact_start.elapsed().as_millis() as u64,
         "compaction completed"
     );
 
-    Ok((response.usage, summary))
+    Ok(Compacted {
+        usage: response.usage,
+        summary,
+        carried: history.len() - summary_len,
+    })
 }
 
-/// `system` and `tools` are the ones the next request will carry: compaction
-/// replaces the transcript and leaves that baseline untouched, so the gauge
-/// cannot be resized without them. `model` is the one writing the summary,
-/// while `hooks` holds the session's own model, the one layers care about.
+/// `next` is what the session would start with now. The summary goes out under
+/// a fresh frame built from it, for the session's own model in `hooks`, so the
+/// gauge measures the prompt the next request really sends and the frame never
+/// goes missing between runs. `model` is the one writing the summary.
 ///
 /// A retry in here can honour a server `Retry-After` that parks the request for
 /// an hour, so esc has to reach it. The cancel comes back as
@@ -308,8 +323,8 @@ pub async fn compact(
     model: &Model,
     history: &mut History,
     gauge: &mut ContextGauge,
-    system: &str,
-    tools: &Value,
+    next: RunContext,
+    mcp: Option<&McpSession>,
     event_tx: &EventSender,
     hooks: &AgentHooks<'_>,
     config: &AgentConfig,
@@ -333,7 +348,7 @@ pub async fn compact(
         event_tx.send(finished(TokenUsage::default(), size_before))?;
         return Ok(DoneReason::Compact);
     };
-    let (usage, summary) = match compact_history(
+    let Compacted { usage, summary, .. } = match compact_history(
         provider,
         model,
         history,
@@ -358,7 +373,10 @@ pub async fn compact(
     ]) {
         history.push(Message::synthetic(post));
     }
-    gauge.reset(history.as_slice(), system, tools);
+    fit_frame(history, next, mcp, hooks.model);
+    if let Some((system, tools)) = history.request_prefix() {
+        gauge.reset(history.as_slice(), system, tools);
+    }
 
     // The summariser read a subset of the session's prompt, so its own count is
     // a floor on the size before, and the only number a gauge that has not seen
@@ -418,12 +436,6 @@ fn strip_images(messages: &mut [Message]) {
                 };
             }
         }
-    }
-}
-
-fn strip_thinking(messages: &mut [Message]) {
-    for msg in messages {
-        msg.content.retain(|block| !block.is_thinking());
     }
 }
 
@@ -613,7 +625,7 @@ mod tests {
     use crate::AgentConfig;
     use crate::agent::hook::testing::script;
     use crate::cancel::CancelToken;
-    use crate::tools::ToolRegistry;
+    use crate::tools::{RequestTools, ToolRegistry};
     use maki_config::CompactionBuffer;
 
     const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
@@ -630,8 +642,11 @@ mod tests {
     /// other, so the baseline would only add noise.
     const NO_SYSTEM: &str = "";
 
-    fn no_tools() -> Value {
-        Value::Array(Vec::new())
+    fn bare_context(model: &Model) -> RunContext {
+        RunContext::fixed(
+            NO_SYSTEM.into(),
+            RequestTools::assembled(Value::Array(Vec::new()), &AgentConfig::default(), model),
+        )
     }
 
     struct MockProvider {
@@ -703,6 +718,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(stop_reason),
+            ..Default::default()
         }
     }
 
@@ -738,8 +754,8 @@ mod tests {
             &model,
             history,
             gauge,
-            NO_SYSTEM,
-            &no_tools(),
+            bare_context(&model),
+            None,
             &EventSender::new(raw_tx, 0),
             &test_hooks(&registry, None, &model, cancel),
             config,
@@ -804,6 +820,10 @@ mod tests {
             assert_eq!(msgs.len(), 2);
             assert!(matches!(msgs[0].role, Role::User));
             assert!(matches!(msgs[1].role, Role::Assistant));
+            assert!(
+                history.request_prefix().is_some(),
+                "a standalone compaction leaves the session a frame, or `/btw` and the gauge have no prompt to read"
+            );
         });
     }
 
@@ -861,6 +881,7 @@ mod tests {
                     ..Default::default()
                 },
                 stop_reason: Some(StopReason::EndTurn),
+                ..Default::default()
             })]);
             let mut history = History::new(vec![Message::user("first".into())]);
             let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
@@ -896,6 +917,7 @@ mod tests {
                 },
                 usage: TokenUsage::default(),
                 stop_reason: Some(StopReason::EndTurn),
+                ..Default::default()
             })]);
             const KEPT: &str = "first";
             let mut history = History::new(vec![Message::user(KEPT.into())]);
@@ -1014,8 +1036,8 @@ mod tests {
             &model,
             history,
             &mut ContextGauge::restored(SUMMARISED_PROMPT),
-            NO_SYSTEM,
-            &no_tools(),
+            bare_context(&model),
+            None,
             &EventSender::new(raw_tx, 0),
             &test_hooks(&registry, None, &model, &cancel),
             &AgentConfig::default(),

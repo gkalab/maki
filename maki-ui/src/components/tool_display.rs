@@ -111,6 +111,16 @@ pub fn error_style() -> RoleStyle {
     }
 }
 
+pub fn notice_style() -> RoleStyle {
+    RoleStyle {
+        prefix: "",
+        text_style: theme::current().tool_dim,
+        prefix_style: theme::current().tool_dim,
+        use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
 pub fn done_style() -> RoleStyle {
     RoleStyle {
         prefix: "",

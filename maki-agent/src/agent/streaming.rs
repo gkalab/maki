@@ -618,6 +618,7 @@ mod tests {
                         ..Default::default()
                     },
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    ..Default::default()
                 })
             })
         }
@@ -878,6 +879,7 @@ mod tests {
                     message: Message::user("ok".into()),
                     usage: TokenUsage::default(),
                     stop_reason: Some(maki_providers::StopReason::EndTurn),
+                    ..Default::default()
                 })
             })
         }

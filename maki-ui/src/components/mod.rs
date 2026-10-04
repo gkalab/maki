@@ -1,3 +1,4 @@
+pub(crate) mod alert_modal;
 pub(crate) mod btw_modal;
 pub(crate) mod code_view;
 pub mod command;
@@ -376,6 +377,8 @@ pub enum DisplayRole {
     Tool(Box<ToolRole>),
     Error,
     Done,
+    /// One dim line about what the host told the model on the user's behalf.
+    Notice,
 }
 
 impl DisplayRole {
